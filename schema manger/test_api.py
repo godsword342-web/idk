@@ -1,12 +1,26 @@
 """test_api.py — mock litellm so we don't hit the network."""
 import asyncio
+import io
+import logging
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 import sys
 
 
 class MockRateLimitError(Exception):
-    pass
+    status_code = 429
+
+    def __init__(self, message, headers=None):
+        super().__init__(message)
+        self.headers = headers or {}
+
+
+class MockNotFoundError(Exception):
+    status_code = 404
+
+
+class MockOverloadError(Exception):
+    status_code = 529
 
 
 class MockContextWindowExceededError(Exception):
@@ -27,6 +41,7 @@ class MockBadRequestError(Exception):
 mock_litellm = MagicMock()
 mock_litellm.acompletion = AsyncMock()
 mock_litellm.RateLimitError = MockRateLimitError
+mock_litellm.NotFoundError = MockNotFoundError
 mock_litellm.ContextWindowExceededError = MockContextWindowExceededError
 mock_litellm.APIError = MockAPIError
 mock_litellm.APIConnectionError = MockAPIConnectionError
@@ -36,6 +51,8 @@ sys.modules["litellm"] = mock_litellm
 mock_dotenv = MagicMock()
 sys.modules["dotenv"] = mock_dotenv
 
+import api
+
 from api import (
     stream, complete, should_enable_thinking,
     ToolCallAccumulator, _freeze_system_prompt,
@@ -43,6 +60,7 @@ from api import (
     _model_supports_thinking,
     get_active_model, set_active_model, list_models,
     ACTIVE_MODEL, FALLBACK_MODELS, _sync_provider_credentials,
+    ProviderRequestError,
 )
 from messages import create_user_message
 
@@ -251,22 +269,160 @@ async def main():
     assert len(thinking_events) == 2
     print("✅ Streaming thinking OK")
 
-    # ── Fallback on rate limit ──
+    # ── 429 honors Retry-After and retries the same model ──
     mock_litellm.acompletion.reset_mock()
-    rate_limit = mock_litellm.RateLimitError("rate limited")
+    rate_limit = mock_litellm.RateLimitError(
+        "rate limited", headers={"Retry-After": "7"},
+    )
     mock_litellm.acompletion.side_effect = [
         rate_limit,
-        stream_yields([mock_chunk(text="from fallback", finish="stop")]),
+        stream_yields([mock_chunk(text="after wait", finish="stop")]),
     ]
     events = []
-    with patch.dict(os.environ, {
+    with patch("api._retry_sleep", new_callable=AsyncMock) as retry_sleep:
+        with patch.dict(os.environ, {
         "LITELLM_FALLBACK_MODELS": "groq/test-approved-fallback",
-    }):
-        async for e in stream([create_user_message("hi")], enable_thinking=False):
-            events.append(e)
+        }):
+            async for e in stream(
+                [create_user_message("hi")], enable_thinking=False,
+            ):
+                events.append(e)
     text_events = [e for e in events if e["type"] == "text_delta"]
-    assert text_events[0]["text"] == "from fallback"
-    print("✅ Fallback on rate limit OK")
+    assert text_events[0]["text"] == "after wait"
+    assert mock_litellm.acompletion.call_count == 2
+    assert all(
+        call.kwargs["model"] == get_active_model()
+        for call in mock_litellm.acompletion.call_args_list
+    )
+    retry_sleep.assert_awaited_once_with(7.0)
+    assert any(
+        event.get("area") == "provider" and event.get("status") == "retrying"
+        and event.get("delay_seconds") == 7.0
+        for event in events
+    )
+    print("✅ 429 Retry-After handling OK")
+
+    # ── Hard quota 429 fails without retries or model switching ──
+    mock_litellm.acompletion.reset_mock()
+    mock_litellm.acompletion.side_effect = MockRateLimitError(
+        "spending limit exceeded",
+    )
+    with patch("api._retry_sleep", new_callable=AsyncMock) as retry_sleep:
+        with patch.dict(os.environ, {
+            "LITELLM_FALLBACK_MODELS": "groq/test-approved-fallback",
+        }):
+            try:
+                async for _ in stream(
+                    [create_user_message("hi")], enable_thinking=False,
+                ):
+                    pass
+                raise AssertionError("expected hard quota failure")
+            except ProviderRequestError as error:
+                assert "rate_limited" in str(error)
+    assert mock_litellm.acompletion.call_count == 1
+    retry_sleep.assert_not_awaited()
+    print("✅ Hard quota 429 fails fast OK")
+
+    # ── Over-budget Retry-After fails instead of retrying early ──
+    mock_litellm.acompletion.reset_mock()
+    mock_litellm.acompletion.side_effect = MockRateLimitError(
+        "temporary rate limit", headers={"Retry-After": "3600"},
+    )
+    with patch("api._retry_sleep", new_callable=AsyncMock) as retry_sleep:
+        try:
+            async for _ in stream(
+                [create_user_message("hi")], enable_thinking=False,
+            ):
+                pass
+            raise AssertionError("expected Retry-After budget failure")
+        except ProviderRequestError as error:
+            assert "rate_limited" in str(error)
+    assert mock_litellm.acompletion.call_count == 1
+    retry_sleep.assert_not_awaited()
+    print("✅ Retry-After budget respected OK")
+
+    # ── 404 does not retry the same model ──
+    mock_litellm.acompletion.reset_mock()
+    not_found = MockNotFoundError("unknown model secret=do-not-log")
+    not_found.request_id = "req-404-safe"
+    mock_litellm.acompletion.side_effect = not_found
+    log_output = io.StringIO()
+    log_handler = logging.StreamHandler(log_output)
+    api.logger.addHandler(log_handler)
+    failure_events = []
+    try:
+        async for event in stream(
+            [create_user_message("hi")],
+            model="nvidia_nim/missing-model",
+            enable_thinking=False,
+        ):
+            failure_events.append(event)
+        raise AssertionError("expected model-not-found failure")
+    except ProviderRequestError as error:
+        assert "model_or_route_not_found" in str(error)
+        assert "req-404-safe" in str(error)
+        assert "secret=do-not-log" not in str(error)
+    finally:
+        api.logger.removeHandler(log_handler)
+        log_handler.close()
+    assert mock_litellm.acompletion.call_count == 1
+    assert "req-404-safe" in log_output.getvalue()
+    assert "secret=do-not-log" not in log_output.getvalue()
+    assert any(
+        event.get("area") == "model" and event.get("status") == "failed"
+        and event.get("request_id") == "req-404-safe"
+        for event in failure_events
+    )
+    print("✅ 404 fails without same-model retry OK")
+
+    # ── 404 can use an explicitly configured alternate model ──
+    mock_litellm.acompletion.reset_mock()
+    mock_litellm.acompletion.side_effect = [
+        MockNotFoundError("unknown model"),
+        stream_yields([mock_chunk(text="alternate", finish="stop")]),
+    ]
+    events = [event async for event in stream(
+        [create_user_message("hi")],
+        model="nvidia_nim/missing-model",
+        fallback_model="groq/approved-model",
+        enable_thinking=False,
+    )]
+    assert mock_litellm.acompletion.call_count == 2
+    assert mock_litellm.acompletion.call_args_list[0].kwargs["model"] == "nvidia_nim/missing-model"
+    assert mock_litellm.acompletion.call_args_list[1].kwargs["model"] == "groq/approved-model"
+    assert any(event.get("text") == "alternate" for event in events)
+    assert next(event for event in events if event["type"] == "message_start")["model"] == "groq/approved-model"
+    assert any(
+        event.get("area") == "provider" and event.get("status") == "fallback"
+        and event.get("alternate_model") == "groq/approved-model"
+        for event in events
+    )
+    print("✅ 404 explicit alternate routing OK")
+
+    # ── 529 retries boundedly, then uses configured alternate ──
+    mock_litellm.acompletion.reset_mock()
+    mock_litellm.acompletion.side_effect = [
+        MockOverloadError("provider overloaded"),
+        MockOverloadError("provider overloaded"),
+        MockOverloadError("provider overloaded"),
+        stream_yields([mock_chunk(text="recovered", finish="stop")]),
+    ]
+    with patch("api._retry_sleep", new_callable=AsyncMock) as retry_sleep:
+        events = [event async for event in stream(
+            [create_user_message("hi")],
+            model="nvidia_nim/model-a",
+            fallback_model="groq/model-b",
+            enable_thinking=False,
+            query_source="subagent_task",
+        )]
+    assert mock_litellm.acompletion.call_count == 4
+    assert [call.kwargs["model"] for call in mock_litellm.acompletion.call_args_list] == [
+        "nvidia_nim/model-a", "nvidia_nim/model-a", "nvidia_nim/model-a",
+        "groq/model-b",
+    ]
+    assert retry_sleep.await_count == 2
+    assert any(event.get("text") == "recovered" for event in events)
+    print("✅ 529 bounded retry + alternate OK")
 
     # ── Permanent model errors do not trigger fallback attempts ──
     mock_litellm.acompletion.reset_mock()
@@ -278,8 +434,8 @@ async def main():
             async for _ in stream([create_user_message("hi")], enable_thinking=False):
                 pass
             raise AssertionError("expected the model error to propagate")
-        except MockBadRequestError:
-            pass
+        except ProviderRequestError as error:
+            assert "provider_error" in str(error)
     assert mock_litellm.acompletion.call_count == 1
     print("✅ Permanent errors do not fall back OK")
 
@@ -287,6 +443,7 @@ async def main():
         _sync_provider_credentials()
         assert os.environ["NVIDIA_NIM_API_KEY"] == "test-only"
         assert "nvidia_nim/nvidia/nemotron-3.5-bolt-e4b" in list_models()
+        assert "nvidia_nim/meta/llama-3.3-70b-instruct" not in list_models()
     print("✅ NVIDIA key alias OK")
 
     with patch.dict(os.environ, {"GEMINI_API_KEY": "test-only"}, clear=True):
@@ -313,6 +470,20 @@ async def main():
     result = await complete([create_user_message("summarize")])
     assert result == "Summary of conversation"
     print("✅ Non-streaming complete OK")
+
+    mock_litellm.acompletion.reset_mock()
+    missing_response = MockNotFoundError("missing primary model")
+    mock_litellm.acompletion.side_effect = [missing_response, resp]
+    result = await complete(
+        [create_user_message("summarize")],
+        model="nvidia_nim/missing-model",
+        fallback_model="groq/approved-model",
+    )
+    assert result == "Summary of conversation"
+    assert [call.kwargs["model"] for call in mock_litellm.acompletion.call_args_list] == [
+        "nvidia_nim/missing-model", "groq/approved-model",
+    ]
+    print("✅ Non-streaming explicit fallback OK")
 
     # ── Model switching ──
     original = get_active_model()

@@ -95,6 +95,13 @@ async def execute_tool(
             f"Unknown tool: {tool_name}. Available tools: {_list_tool_names()}",
         )
 
+    allowed_tools = getattr(context, "allowed_tool_names", None)
+    if allowed_tools is not None and tool_name not in allowed_tools:
+        return _error_result(
+            tool_use_id, tool_name,
+            f"Tool {tool_name} is not available in this task context.",
+        )
+
     # ── 2. Abort check (before doing any work) ──
     abort = getattr(context, "abort_controller", None)
     if abort is not None and getattr(abort, "aborted", False):
@@ -117,6 +124,14 @@ async def execute_tool(
         return _error_result(
             tool_use_id, tool_name, f"Invalid input for {tool_name}: {e}",
         )
+
+    file_scope = getattr(context, "file_scope", None)
+    if file_scope is not None and tool_name in ("Read", "Edit", "Write"):
+        path_error = file_scope.check_access(
+            tool_name, getattr(parsed_input, "file_path", ""),
+        )
+        if path_error:
+            return _error_result(tool_use_id, tool_name, path_error)
 
     # ── 4. validate_input (model-audience coherence check) ──
     try:

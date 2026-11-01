@@ -291,6 +291,22 @@ async def _call(
 
     # 5. Update AppState (source)
     _set_todos_in_app_state(ctx, stored_todos)
+    if on_progress is not None:
+        try:
+            on_progress({
+                "type": "plan_activity",
+                "status": "updated",
+                "item_count": len(stored_todos),
+                "completed_count": sum(
+                    todo["status"] == "completed" for todo in stored_todos
+                ),
+                "in_progress_count": sum(
+                    todo["status"] == "in_progress" for todo in stored_todos
+                ),
+                "cleared": all_done,
+            })
+        except Exception:
+            pass
 
     # 6. Mirror to store for cross-session survival (our addition)
     store = _get_store(ctx)

@@ -26,7 +26,10 @@ import inspect
 import json
 import logging
 import os
-from typing import AsyncGenerator
+import random
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import AsyncGenerator, Callable
 
 from dotenv import load_dotenv
 
@@ -73,7 +76,6 @@ PROVIDERS: dict[str, dict] = {
         "env_key": "NVIDIA_NIM_API_KEY",
         "legacy_env_key": "NVIDIA_API_KEY",
         "models": [
-            "nvidia_nim/meta/llama-3.3-70b-instruct",
             "nvidia_nim/nvidia/nemotron-3.5-bolt-e4b",
         ],
     },
@@ -113,6 +115,160 @@ FALLBACK_MODELS: list[str] = _configured_fallback_models()
 # ── Constants ────────────────────────────────────────────────────────────
 
 MAX_MEDIA_PER_REQUEST = 100
+MAX_RETRIES_PER_MODEL = 2
+MAX_RETRY_BACKOFF_SECONDS = 8.0
+MAX_RETRY_AFTER_SECONDS = 120.0
+RETRY_BACKOFF_BASE_SECONDS = 1.0
+
+
+class ProviderRequestError(RuntimeError):
+    """Safe user-facing summary for a failed provider request."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str = "provider_error",
+        status_code: int | None = None,
+        model: str | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.status_code = status_code
+        self.model = model
+        self.request_id = request_id
+
+
+def _status_code(error: Exception) -> int | None:
+    response = getattr(error, "response", None)
+    value = getattr(error, "status_code", None) or getattr(response, "status_code", None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _request_id(error: Exception) -> str | None:
+    value = getattr(error, "request_id", None)
+    if value:
+        return str(value)[:128]
+    response = getattr(error, "response", None)
+    headers = getattr(error, "headers", None) or getattr(response, "headers", None) or {}
+    for key in ("x-request-id", "request-id", "x-nvidia-request-id"):
+        value = headers.get(key) if hasattr(headers, "get") else None
+        if value:
+            return str(value)[:128]
+    return None
+
+
+def _failure_category(error: Exception) -> str:
+    status = _status_code(error)
+    name = type(error).__name__.lower()
+    if name == "contextwindowexceedederror":
+        return "context_overflow"
+    if status == 404 or "notfounderror" in name:
+        return "model_or_route_not_found"
+    if status == 429 or "ratelimiterror" in name:
+        return "rate_limited"
+    if status == 529 or (status is not None and 500 <= status <= 599):
+        return "provider_overloaded"
+    if "apiconnectionerror" in name or "timeout" in name:
+        return "connection_failure"
+    if status in (401, 403):
+        return "authentication_or_permission"
+    return "provider_error"
+
+
+def _is_hard_rate_limit(error: Exception) -> bool:
+    category = str(getattr(error, "category", "")).lower()
+    rate_limit_type = str(getattr(error, "rate_limit_type", "")).lower()
+    detail = " ".join((
+        str(error),
+        str(getattr(error, "message", "")),
+        str(getattr(error, "detail", "")),
+        str(getattr(error, "body", "")),
+    )).lower()
+    markers = ("spend", "billing", "insufficient_quota", "usage limit", "credit")
+    return any(marker in value for value in (category, rate_limit_type, detail)
+               for marker in markers)
+
+
+def _retry_after_seconds(error: Exception) -> float | None:
+    response = getattr(error, "response", None)
+    headers = getattr(error, "headers", None) or getattr(response, "headers", None) or {}
+    value = None
+    if hasattr(headers, "items"):
+        value = next((v for k, v in headers.items() if str(k).lower() == "retry-after"), None)
+    if value is None:
+        return None
+    try:
+        delay = float(value)
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(str(value))
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if delay < 0 or delay > MAX_RETRY_AFTER_SECONDS:
+        return None
+    return delay
+
+
+def _retry_delay(error: Exception, retry_index: int) -> float | None:
+    response = getattr(error, "response", None)
+    headers = getattr(error, "headers", None) or getattr(response, "headers", None) or {}
+    if hasattr(headers, "items") and any(
+        str(key).lower() == "retry-after" for key, _value in headers.items()
+    ):
+        return _retry_after_seconds(error)
+    retry_after = _retry_after_seconds(error)
+    if retry_after is not None:
+        return retry_after
+    delay = min(
+        RETRY_BACKOFF_BASE_SECONDS * (2 ** retry_index),
+        MAX_RETRY_BACKOFF_SECONDS,
+    )
+    return delay * random.uniform(0.75, 1.25)
+
+
+async def _retry_sleep(delay: float) -> None:
+    await asyncio.sleep(delay)
+
+
+def _log_provider_failure(
+    error: Exception, model: str, query_source: str | None, attempt: int,
+) -> str:
+    category = _failure_category(error)
+    status = _status_code(error)
+    request_id = _request_id(error)
+    provider = model.split("/", 1)[0] if "/" in model else "unknown"
+    logger.warning(
+        "LLM request failed provider=%s model=%s category=%s status=%s "
+        "request_id=%s query_source=%s attempt=%s",
+        provider, model, category, status or "unknown",
+        request_id or "unknown", query_source or "unknown", attempt,
+    )
+    details = f"provider={provider} model={model} category={category}"
+    if status is not None:
+        details += f" status={status}"
+    if request_id:
+        details += f" request_id={request_id}"
+    return details
+
+
+def _provider_request_error(
+    error: Exception, details: str, model: str,
+) -> ProviderRequestError:
+    return ProviderRequestError(
+        details,
+        category=_failure_category(error),
+        status_code=_status_code(error),
+        model=model,
+        request_id=_request_id(error),
+    )
 
 
 # ── Mode control ─────────────────────────────────────────────────────────
@@ -348,6 +504,8 @@ async def stream(
     max_tokens: int = 8192,
     enable_thinking: bool | None = None,
     signal: Any = None,
+    fallback_model: str | None = None,
+    query_source: str | None = None,
 ) -> AsyncGenerator[dict, None]:
     """Stream a model response with normalized events.
 
@@ -390,7 +548,33 @@ async def stream(
     if enable_thinking is None:
         enable_thinking = should_enable_thinking(messages, target_model)
 
-    response = await _call_with_fallback(kwargs, enable_thinking)
+    activity_events: list[dict[str, object]] = []
+    yield {
+        "type": "runtime_activity", "area": "model", "status": "started",
+        "model": target_model, "query_source": query_source or "unknown",
+    }
+    try:
+        response, target_model = await _call_with_fallback(
+            kwargs, enable_thinking, fallback_model=fallback_model,
+            query_source=query_source, on_event=activity_events.append,
+        )
+    except ProviderRequestError as error:
+        for event in activity_events:
+            yield event
+        yield {
+            "type": "runtime_activity", "area": "model", "status": "failed",
+            "model": error.model or target_model, "category": error.category,
+            "status_code": error.status_code, "request_id": error.request_id,
+            "query_source": query_source or "unknown",
+        }
+        raise
+
+    for event in activity_events:
+        yield event
+    yield {
+        "type": "runtime_activity", "area": "model", "status": "streaming",
+        "model": target_model, "query_source": query_source or "unknown",
+    }
 
     yield {"type": "message_start", "model": target_model}
 
@@ -435,6 +619,7 @@ async def stream(
             text = await complete(
                 messages, system_prompt=system_prompt,
                 model=target_model, max_tokens=max_tokens,
+                fallback_model=fallback_model, query_source=query_source,
             )
             yield {"type": "text_delta", "text": text}
             yield {
@@ -444,12 +629,21 @@ async def stream(
                                          "cache_creation_input_tokens": 0},
                 "model": target_model, "text": text, "thinking": None,
             }
+            yield {
+                "type": "runtime_activity", "area": "model",
+                "status": "completed", "model": target_model,
+                "query_source": query_source or "unknown",
+            }
             return
         except Exception as e2:
             logger.error("Non-streaming fallback failed: %s", e2)
-            raise e
+            raise e2
 
     if _signal_aborted(signal):
+        yield {
+            "type": "runtime_activity", "area": "model", "status": "interrupted",
+            "model": target_model, "query_source": query_source or "unknown",
+        }
         yield {
             "type": "message_stop", "stop_reason": "interrupted",
             "usage": final_usage or _empty_usage(), "model": target_model,
@@ -477,6 +671,10 @@ async def stream(
         "model": target_model,
         "text": "".join(text_buf) if text_buf else None,
         "thinking": "".join(thinking_buf) if thinking_buf else None,
+    }
+    yield {
+        "type": "runtime_activity", "area": "model", "status": "completed",
+        "model": target_model, "query_source": query_source or "unknown",
     }
 
 
@@ -544,46 +742,105 @@ async def _iterate_response(response: Any, signal: Any):
 
 # ── Fallback on rate limit ──────────────────────────────────────────────
 
-async def _call_with_fallback(kwargs: dict, enable_thinking: bool):
+async def _call_with_fallback(
+    kwargs: dict,
+    enable_thinking: bool,
+    *,
+    fallback_model: str | None = None,
+    query_source: str | None = None,
+    on_event: Callable[[dict[str, object]], None] | None = None,
+):
     original_model = kwargs["model"]
     fallback_models = [
         model for model in _configured_fallback_models()
         if model != original_model
     ]
+    if fallback_model and fallback_model != original_model:
+        fallback_models.insert(0, _normalize_model_name(fallback_model))
+    fallback_models = list(dict.fromkeys(fallback_models))
     attempts = [original_model, *fallback_models]
 
-    primary_rate_limit: Exception | None = None
-    last_fallback_error: Exception | None = None
-    for model in attempts:
+    def notify(event: dict[str, object]) -> None:
+        if on_event is None:
+            return
         try:
-            kwargs["model"] = model
-            call_kwargs = dict(kwargs)
+            on_event({"type": "runtime_activity", "area": "provider", **event})
+        except Exception:
+            pass
+
+    for model_index, model in enumerate(attempts):
+        retry_index = 0
+        while True:
+            call_kwargs = {**kwargs, "model": model, "num_retries": 0}
             if enable_thinking and _model_supports_thinking(model):
                 call_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 4096}
-            response = await litellm.acompletion(**call_kwargs)
-            if model != original_model:
-                logger.info("Fell back from %s to %s", original_model, model)
-            return response
-        except litellm.RateLimitError as e:
-            if model == original_model:
-                primary_rate_limit = e
-            else:
-                last_fallback_error = e
-            logger.warning("Rate limit on %s", model)
-        except litellm.ContextWindowExceededError:
-            raise
-        except Exception as e:
-            if model == original_model:
-                raise
-            last_fallback_error = e
-            logger.warning("Configured fallback %s failed: %s", model, e)
+            try:
+                response = await litellm.acompletion(**call_kwargs)
+                if model != original_model:
+                    logger.info("Fell back from %s to %s", original_model, model)
+                return response, model
+            except Exception as error:
+                category = _failure_category(error)
+                details = _log_provider_failure(
+                    error, model, query_source, retry_index + 1,
+                )
 
-    kwargs["model"] = original_model
-    if primary_rate_limit is not None:
-        if last_fallback_error is not None:
-            raise primary_rate_limit from last_fallback_error
-        raise primary_rate_limit
-    raise RuntimeError("No configured model could be called")
+                if category == "rate_limited":
+                    if not _is_hard_rate_limit(error) and retry_index < MAX_RETRIES_PER_MODEL:
+                        delay = _retry_delay(error, retry_index)
+                        if delay is not None:
+                            notify({
+                                "status": "retrying", "model": model,
+                                "category": category, "attempt": retry_index + 1,
+                                "delay_seconds": round(delay, 2),
+                            })
+                            await _retry_sleep(delay)
+                            retry_index += 1
+                            continue
+                    raise _provider_request_error(error, details, model) from error
+
+                if category in ("provider_overloaded", "connection_failure"):
+                    if retry_index < MAX_RETRIES_PER_MODEL:
+                        delay = _retry_delay(error, retry_index)
+                        if delay is not None:
+                            notify({
+                                "status": "retrying", "model": model,
+                                "category": category, "attempt": retry_index + 1,
+                                "delay_seconds": round(delay, 2),
+                            })
+                            await _retry_sleep(delay)
+                            retry_index += 1
+                            continue
+                    if model_index + 1 < len(attempts):
+                        notify({
+                            "status": "fallback", "model": model,
+                            "alternate_model": attempts[model_index + 1],
+                            "category": category,
+                        })
+                        logger.info(
+                            "Trying configured alternate after %s model=%s query_source=%s",
+                            category, model, query_source or "unknown",
+                        )
+                        break
+
+                elif category == "model_or_route_not_found" and model_index + 1 < len(attempts):
+                    notify({
+                        "status": "fallback", "model": model,
+                        "alternate_model": attempts[model_index + 1],
+                        "category": category,
+                    })
+                    logger.info(
+                        "Trying configured alternate after model/route not found "
+                        "model=%s query_source=%s",
+                        model, query_source or "unknown",
+                    )
+                    break
+
+                raise _provider_request_error(error, details, model) from error
+
+    raise ProviderRequestError(
+        f"No configured model could complete the request (primary={original_model})"
+    )
 
 
 # ── Non-streaming complete ──────────────────────────────────────────────
@@ -594,6 +851,8 @@ async def complete(
     model: str | None = None,
     max_tokens: int = 512,
     response_format: dict | None = None,
+    fallback_model: str | None = None,
+    query_source: str | None = None,
 ) -> str:
     """Non-streaming one-shot completion. Used by compaction and classifier."""
     target_model = model or ACTIVE_MODEL
@@ -612,20 +871,9 @@ async def complete(
     if response_format:
         kwargs["response_format"] = response_format
 
-    try:
-        response = await litellm.acompletion(**kwargs)
-    except litellm.RateLimitError as primary_rate_limit:
-        last_fallback_error: Exception | None = None
-        for fallback in _configured_fallback_models():
-            try:
-                kwargs["model"] = fallback
-                response = await litellm.acompletion(**kwargs)
-                break
-            except Exception as error:
-                last_fallback_error = error
-        else:
-            if last_fallback_error is not None:
-                raise primary_rate_limit from last_fallback_error
-            raise
+    response, _response_model = await _call_with_fallback(
+        kwargs, enable_thinking=False, fallback_model=fallback_model,
+        query_source=query_source,
+    )
 
     return response.choices[0].message.content or ""

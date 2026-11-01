@@ -37,17 +37,46 @@ def _session_id(context: ToolUseContext) -> str:
     return session_id
 
 
-async def _search(input: MemorySearchInput, context: ToolUseContext, *_args) -> ToolResult:
+def _emit_memory_progress(on_progress, action: str, status: str, **details) -> None:
+    if on_progress is None:
+        return
+    try:
+        on_progress({
+            "type": "memory_activity",
+            "action": action,
+            "status": status,
+            **details,
+        })
+    except Exception:
+        pass
+
+
+async def _search(
+    input: MemorySearchInput, context: ToolUseContext, _can_use_tool=None,
+    _parent_message=None, on_progress=None,
+) -> ToolResult:
+    _emit_memory_progress(on_progress, "search", "started")
     try:
         results = _store(context).search(
             input.query, _session_id(context), limit=input.limit,
         )
     except Exception as error:
+        _emit_memory_progress(on_progress, "search", "failed", error_type=type(error).__name__)
         raise ValueError(f"Memory search failed: {error}") from error
+    _emit_memory_progress(
+        on_progress, "search", "completed", result_count=len(results),
+        source_ids=[item.get("id") for item in results[:20] if item.get("id") is not None],
+    )
     return ToolResult(data=results)
 
 
-async def _expand(input: MemoryExpandInput, context: ToolUseContext, *_args) -> ToolResult:
+async def _expand(
+    input: MemoryExpandInput, context: ToolUseContext, _can_use_tool=None,
+    _parent_message=None, on_progress=None,
+) -> ToolResult:
+    _emit_memory_progress(
+        on_progress, "expand", "started", node_id=input.node_id, kind=input.kind,
+    )
     try:
         results = _store(context).expand(
             input.node_id,
@@ -55,7 +84,15 @@ async def _expand(input: MemoryExpandInput, context: ToolUseContext, *_args) -> 
             session_id=_session_id(context),
         )
     except Exception as error:
+        _emit_memory_progress(
+            on_progress, "expand", "failed", node_id=input.node_id,
+            kind=input.kind, error_type=type(error).__name__,
+        )
         raise ValueError(f"Memory expansion failed: {error}") from error
+    _emit_memory_progress(
+        on_progress, "expand", "completed", node_id=input.node_id,
+        kind=input.kind, result_count=len(results),
+    )
     return ToolResult(data=results)
 
 

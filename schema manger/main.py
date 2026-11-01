@@ -43,6 +43,7 @@ from system_context import (
 )
 from tool import ToolUseContext
 from memory_tools import MemoryExpandTool, MemorySearchTool
+from agent_tasks import AgentTasksTool
 from todo import TodoWriteTool
 from tools.bash import BashTool
 from tools.edit import EditTool
@@ -55,6 +56,7 @@ register(EditTool)
 register(WriteTool)
 register(BashTool)
 register(TodoWriteTool)
+register(AgentTasksTool)
 register(MemorySearchTool)
 register(MemoryExpandTool)
 
@@ -70,6 +72,9 @@ Available tools:
     Read existing files first; prefer Edit for targeted changes.
 - Bash(command, timeout?, description?): runs a shell command.
 - TodoWrite(todos): updates the current task list.
+- Task(tasks): runs a DAG of isolated task workers. Declare `needs`, `read_files`, and
+    `write_files`; dependency outputs are passed directly. Read-only tasks fan out,
+    while all writing tasks run exclusively.
 - MemorySearch(query, limit?): searches this session's saved messages.
 - MemoryExpand(node_id, kind?): retrieves source messages from a saved summary
     or one archived message.

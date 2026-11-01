@@ -1,10 +1,11 @@
 """test_query_primitives.py — verifies query_config, query_transitions, query_deps."""
 import asyncio
 import os
+from unittest.mock import patch
 
 from query_config import build_query_config, QueryConfig, QueryGates
 from query_transitions import Continue, Terminal
-from query_deps import production_deps, NoopDeps, QueryDeps
+from query_deps import production_deps, NoopDeps, QueryDeps, _production_call_model
 
 
 async def main():
@@ -64,6 +65,82 @@ async def main():
     assert callable(deps.uuid)
     assert deps.uuid() != deps.uuid()
     print("✅ production_deps OK")
+
+    # ── Production adapter preserves route metadata ──
+    from messages import create_user_message
+
+    captured = {}
+
+    async def fake_stream(**kwargs):
+        captured.update(kwargs)
+        yield {
+            "type": "runtime_activity", "area": "model",
+            "status": "started", "model": kwargs.get("model"),
+        }
+        yield {"type": "message_stop", "stop_reason": "end_turn", "usage": {}}
+
+    with patch("api.stream", fake_stream):
+        result = [message async for message in _production_call_model(
+            messages=[create_user_message("route test")],
+            system_prompt="test",
+            options={
+                "model": "nvidia_nim/model-a",
+                "fallback_model": "groq/model-b",
+                "query_source": "subagent_task",
+                "max_output_tokens_override": 4096,
+            },
+        )]
+    assert captured["model"] == "nvidia_nim/model-a"
+    assert captured["fallback_model"] == "groq/model-b"
+    assert captured["query_source"] == "subagent_task"
+    assert captured["max_tokens"] == 4096
+    assert result[0]["type"] == "runtime_activity"
+    assert result[-1].stop_reason == "end_turn"
+    print("✅ Production adapter preserves route metadata")
+
+    from api import ProviderRequestError
+
+    async def failing_stream(**_kwargs):
+        if False:
+            yield {}
+        raise ProviderRequestError(
+            "provider=nvidia_nim model=nvidia_nim/missing category=model_or_route_not_found status=404",
+            category="model_or_route_not_found",
+            status_code=404,
+            model="nvidia_nim/missing",
+        )
+
+    with patch("api.stream", failing_stream):
+        failure = [message async for message in _production_call_model(
+            messages=[create_user_message("route error")],
+            system_prompt="test",
+            options={"model": "nvidia_nim/missing"},
+        )]
+    assert failure[-1].is_api_error is True
+    assert failure[-1].api_error == "model_or_route_not_found"
+    assert "status=404" in failure[-1].content
+    print("✅ Provider failure becomes a query error message")
+
+    async def overflow_stream(**_kwargs):
+        if False:
+            yield {}
+        raise ProviderRequestError(
+            "provider=gemini model=gemini/model category=context_overflow status=400",
+            category="context_overflow",
+            status_code=400,
+            model="gemini/model",
+        )
+
+    with patch("api.stream", overflow_stream):
+        overflow = [message async for message in _production_call_model(
+            messages=[create_user_message("too much context")],
+            system_prompt="test",
+            options={"model": "gemini/model"},
+        )]
+    assert overflow[-1].is_api_error is True
+    assert overflow[-1].api_error == "invalid_request"
+    assert "too long" in overflow[-1].content.lower()
+    print("✅ Context overflow remains eligible for compaction")
 
     # ── NoopDeps yields scripted responses ──
     from messages import create_assistant_message

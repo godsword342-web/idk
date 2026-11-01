@@ -223,7 +223,7 @@ class AgentApp(App):
     """
 
     BINDINGS = [
-        Binding("ctrl+c", "interrupt", "Interrupt", priority=True),
+        Binding("ctrl+c", "interrupt", "Exit", priority=True),
         Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+l", "new_session", "New session"),
     ]
@@ -236,6 +236,7 @@ class AgentApp(App):
         self._current_markdown: StreamingMarkdown | None = None
         self._tool_cards: dict[str, ToolCard] = {}
         self._turn_tokens = 0
+        self._exit_when_idle = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -276,7 +277,7 @@ class AgentApp(App):
         elif text == "/help":
             self._append_widget(SystemNotice(
                 "/tools lists capabilities | /model [id] switches provider model | "
-                "/clear starts a fresh session | Ctrl+C interrupts",
+                "/clear starts a fresh session | Ctrl+C exits",
             ))
         elif text == "/tools":
             tools = "\n".join(
@@ -342,6 +343,8 @@ class AgentApp(App):
             composer = self.query_one("#composer", Input)
             composer.disabled = False
             composer.focus()
+            if self._exit_when_idle:
+                self.exit()
 
     async def _dispatch_event(self, event: Any) -> None:
         if isinstance(event, Terminal):
@@ -351,6 +354,8 @@ class AgentApp(App):
         if isinstance(event, dict):
             if event.get("type") == "stream_request_start":
                 self.query_one(StatusBar).set_running("Thinking")
+            elif event.get("type") == "runtime_activity":
+                self._show_runtime_activity(event)
             elif event.get("type") == "tombstone":
                 self._append_widget(SystemNotice("Retrying with configured fallback."))
             return
@@ -388,7 +393,24 @@ class AgentApp(App):
             self._refresh_plan()
         elif event_type == "progress" or isinstance(event, ProgressMessage):
             data = getattr(event, "data", None) or {}
-            if data.get("type") == "bash_progress":
+            if data.get("type") == "task_lifecycle":
+                task_id = data.get("task_id", "task")
+                status = data.get("status", "updated")
+                dependencies = data.get("needs") or []
+                detail = f" ({', '.join(dependencies)})" if dependencies else ""
+                duration = data.get("duration_ms")
+                if duration is not None:
+                    detail += f" · {duration} ms"
+                error_type = data.get("error_type")
+                if error_type:
+                    detail += f" · {error_type}"
+                level = "error" if status == "failed" else "warn" if status == "blocked" else "info"
+                self._append_widget(SystemNotice(
+                    f"Task {task_id}: {status}{detail}", level,
+                ))
+            elif data.get("type") in ("plan_activity", "memory_activity"):
+                self._show_runtime_activity(data)
+            elif data.get("type") == "bash_progress":
                 tool_id = getattr(event, "tool_use_id", "")
                 card = self._tool_cards.get(tool_id)
                 output = data.get("output", "")
@@ -412,6 +434,70 @@ class AgentApp(App):
         plan = store.get_plan(session_id) if store is not None and session_id else None
         self.query_one(PlanPanel).refresh_from_plan(plan)
 
+    def _show_runtime_activity(self, event: dict) -> None:
+        area = event.get("area")
+        if area == "memory":
+            source = event.get("source", "memory")
+            names = event.get("names") or []
+            suffix = f": {', '.join(names)}" if names else ""
+            text = f"Memory context injected ({source}, {event.get('count', 0)} items){suffix}"
+            level = "info"
+        elif event.get("type") == "memory_activity":
+            action = event.get("action", "memory")
+            status = event.get("status", "updated")
+            count = event.get("result_count")
+            suffix = f" ({count} results)" if count is not None else ""
+            if event.get("node_id") is not None:
+                suffix += f" · source {event['node_id']}"
+            text = f"Memory {action}: {status}{suffix}"
+            level = "error" if status == "failed" else "info"
+        elif event.get("type") == "plan_activity":
+            if event.get("cleared"):
+                text = "Plan completed and cleared"
+            else:
+                text = (
+                    f"Plan updated: {event.get('item_count', 0)} items, "
+                    f"{event.get('completed_count', 0)} complete, "
+                    f"{event.get('in_progress_count', 0)} active"
+                )
+            level = "info"
+        elif area == "provider":
+            status = event.get("status", "updated")
+            model = event.get("model", "provider")
+            if status == "retrying":
+                text = (
+                    f"Provider retry: {model} ({event.get('category', 'temporary failure')}, "
+                    f"attempt {event.get('attempt', '?')}, "
+                    f"wait {event.get('delay_seconds', 0)}s)"
+                )
+                level = "warn"
+            elif status == "fallback":
+                text = (
+                    f"Provider fallback: {model} → "
+                    f"{event.get('alternate_model', 'alternate')} "
+                    f"({event.get('category', 'provider failure')})"
+                )
+                level = "warn"
+            else:
+                text = f"Provider {status}: {model}"
+                level = "error" if status == "failed" else "info"
+                if event.get("status_code"):
+                    text += f" · HTTP {event['status_code']}"
+                if event.get("request_id"):
+                    text += f" · request {event['request_id']}"
+        elif area == "model":
+            status = event.get("status", "updated")
+            model = event.get("model", "model")
+            text = f"Model {status}: {model}"
+            level = "error" if status == "failed" else "info"
+            if event.get("status_code"):
+                text += f" · HTTP {event['status_code']}"
+            if event.get("request_id"):
+                text += f" · request {event['request_id']}"
+        else:
+            return
+        self._append_widget(SystemNotice(text, level))
+
     def _summarize_input(self, inputs: Any) -> str:
         if not isinstance(inputs, dict):
             return ""
@@ -433,10 +519,17 @@ class AgentApp(App):
         self.sub_title = getattr(self.ctx, "session_id", "session")
 
     def action_interrupt(self) -> None:
+        worker = self._worker
+        if worker is None or worker.is_finished:
+            self.exit()
+            return
+
         controller = getattr(self.ctx, "abort_controller", None)
-        if self._worker is not None and not self._worker.is_finished and controller:
+        if controller:
             controller.abort("interrupt")
-            self.query_one(StatusBar).set_running("Interrupt requested")
+        self._exit_when_idle = True
+        worker.cancel()
+        self.query_one(StatusBar).set_running("Closing")
 
     def action_new_session(self) -> None:
         if self._worker is not None and not self._worker.is_finished:

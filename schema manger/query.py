@@ -303,6 +303,7 @@ async def query_loop(
     while True:
         _publish_query_messages(params, state.messages)
         ctx = state.tool_use_context
+        available_tools = _tools_for_context(ctx)
         _archive_query_messages(ctx, state.messages)
         active_view = _active_store_view(ctx, state.messages)
         if active_view is not None:
@@ -311,10 +312,14 @@ async def query_loop(
         messages = state.messages
         user_context_for_query = dict(params.user_context)
         if ctx is not None:
+            memory_events: list[dict[str, object]] = []
             memory_context = await build_memory_injection(
                 messages, ctx, params.query_source,
                 include_summary=active_view is None,
+                on_event=memory_events.append,
             )
+            for event in memory_events:
+                yield event
             if memory_context:
                 user_context_for_query["Session memory"] = memory_context
         tracking = state.auto_compact_tracking
@@ -399,7 +404,7 @@ async def query_loop(
         executor: StreamingToolExecutor | None = None
         if use_streaming:
             executor = StreamingToolExecutor(
-                all_tools(), params.can_use_tool, ctx,
+                available_tools, params.can_use_tool, ctx,
             )
 
         assistant_messages: list[AssistantMessage] = []
@@ -431,10 +436,12 @@ async def query_loop(
                 async for msg in deps.call_model(
                     messages=_prepend_user_context(messages_for_query, user_context_for_query),
                     system_prompt=full_system_prompt,
-                    tools=all_tools(),
+                    tools=available_tools,
                     signal=getattr(ctx.abort_controller, "signal", None),
                     options={
                         "model": _current_model(ctx),
+                        "fallback_model": params.fallback_model,
+                        "query_source": params.query_source,
                         "max_output_tokens_override": state.max_output_tokens_override,
                         "task_budget": (
                             {
@@ -475,7 +482,7 @@ async def query_loop(
                     if executor is not None:
                         executor.discard()
                         executor = StreamingToolExecutor(
-                            all_tools(), params.can_use_tool, ctx,
+                            available_tools, params.can_use_tool, ctx,
                         )
                     
                     try:
@@ -776,6 +783,14 @@ def _current_model(ctx: ToolUseContext) -> str:
 def _publish_query_messages(params: QueryParams, messages: list) -> None:
     """Keep the caller's history synchronized with the active query view."""
     params.messages[:] = messages
+
+
+def _tools_for_context(context: ToolUseContext | None) -> list:
+    tools = all_tools()
+    allowed = getattr(context, "allowed_tool_names", None)
+    if allowed is None:
+        return tools
+    return [tool for tool in tools if tool.name in allowed]
 
 
 def _archive_query_messages(context: ToolUseContext, messages: list) -> None:

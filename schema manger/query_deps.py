@@ -75,14 +75,22 @@ def _production_call_model(
     Yields one AssistantMessage per content block (text or tool_use),
     plus a final message carrying stop_reason + usage.
     """
+    options = options or {}
     return _adapter_gen(
         messages=messages, system_prompt=system_prompt, tools=tools or [],
         signal=signal,
+        model=options.get("model"),
+        fallback_model=options.get("fallback_model"),
+        query_source=options.get("query_source"),
+        max_tokens=options.get("max_output_tokens_override"),
     )
 
 
-async def _adapter_gen(messages, system_prompt, tools, signal=None):
-    from api import stream
+async def _adapter_gen(
+    messages, system_prompt, tools, signal=None, model=None,
+    fallback_model=None, query_source=None, max_tokens=None,
+):
+    from api import ProviderRequestError, stream
     from messages import ToolUseBlock, create_assistant_message
 
     if isinstance(system_prompt, list):
@@ -98,30 +106,52 @@ async def _adapter_gen(messages, system_prompt, tools, signal=None):
     stop_reason: str | None = None
     usage: dict | None = None
 
-    async for event in stream(
-        messages=messages, tools=tools, system_prompt=sp, signal=signal,
-    ):
-        t = event.get("type")
-        if t == "text_delta":
-            text_buf.append(event["text"])
-        elif t == "thinking_delta":
-            thinking_buf.append(event["thinking"])
-        elif t == "tool_use":
-            if text_buf:
+    try:
+        async for event in stream(
+            messages=messages,
+            tools=tools,
+            system_prompt=sp,
+            signal=signal,
+            model=model,
+            fallback_model=fallback_model,
+            query_source=query_source,
+            max_tokens=max_tokens or 8192,
+        ):
+            t = event.get("type")
+            if t == "runtime_activity":
+                yield event
+            elif t == "text_delta":
+                text_buf.append(event["text"])
+            elif t == "thinking_delta":
+                thinking_buf.append(event["thinking"])
+            elif t == "tool_use":
+                if text_buf:
+                    yield create_assistant_message(
+                        content="".join(text_buf), tool_calls=[], stop_reason=None,
+                    )
+                    text_buf = []
                 yield create_assistant_message(
-                    content="".join(text_buf), tool_calls=[], stop_reason=None,
+                    content=None,
+                    tool_calls=[ToolUseBlock(
+                        id=event["id"], name=event["name"], input=event["input"],
+                    )],
+                    stop_reason=None,
                 )
-                text_buf = []
-            yield create_assistant_message(
-                content=None,
-                tool_calls=[ToolUseBlock(
-                    id=event["id"], name=event["name"], input=event["input"],
-                )],
-                stop_reason=None,
-            )
-        elif t == "message_stop":
-            stop_reason = event["stop_reason"]
-            usage = event["usage"]
+            elif t == "message_stop":
+                stop_reason = event["stop_reason"]
+                usage = event["usage"]
+    except ProviderRequestError as error:
+        if error.category == "context_overflow":
+            content = "Prompt is too long. Use /compact or /clear."
+            api_error = "invalid_request"
+        else:
+            content = f"Provider request failed: {error}"
+            api_error = error.category
+        failure = create_assistant_message(content=content, stop_reason="end_turn")
+        failure.is_api_error = True
+        failure.api_error = api_error
+        yield failure
+        return
 
     final = create_assistant_message(
         content="".join(text_buf) if text_buf else None,

@@ -49,12 +49,15 @@ async def main():
         context.session_id = session_id
         context.project_root = temporary
         messages = [create_user_message("How does deployment work?")]
+        injection_events = []
 
         with patch.dict(os.environ, {
             "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE": memory_dir,
             "CLAUDE_MEMORY_LLM_SELECT": "0",
         }):
-            injected = await build_memory_injection(messages, context)
+            injected = await build_memory_injection(
+                messages, context, on_event=injection_events.append,
+            )
             assert "Plan: Release deployment" in injected
             assert "Prior deployment discussion" in injected
             assert "Deployment Guide" in injected
@@ -62,6 +65,14 @@ async def main():
 
             second_injection = await build_memory_injection(messages, context)
             assert "Deployment Guide" not in second_injection
+        assert {event["source"] for event in injection_events} == {
+            "plan", "conversation_summary", "project_files",
+        }
+        assert all("content" not in event for event in injection_events)
+        assert "Deployment Guide" in next(
+            event["names"] for event in injection_events
+            if event["source"] == "project_files"
+        )
 
         with patch.dict(os.environ, {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}):
             disabled_injection = await build_memory_injection(messages, context)
@@ -71,12 +82,24 @@ async def main():
         search_result = await MemorySearchTool.call(
             MemorySearchInput(query="deployment"), context,
         )
+        search_events = []
+        search_result = await MemorySearchTool.call(
+            MemorySearchInput(query="deployment"), context,
+            on_progress=search_events.append,
+        )
         assert search_result.data and search_result.data[0]["id"] == source_id
+        assert [event["status"] for event in search_events] == ["started", "completed"]
+        assert search_events[-1]["result_count"] == 1
+        assert "query" not in search_events[-1]
 
+        expand_events = []
         expand_result = await MemoryExpandTool.call(
             MemoryExpandInput(node_id=summary_id), context,
+            on_progress=expand_events.append,
         )
         assert expand_result.data[0]["content"] == "deployment release process"
+        assert [event["status"] for event in expand_events] == ["started", "completed"]
+        assert "content" not in expand_events[-1]
 
         from main import _persist_query_messages
 

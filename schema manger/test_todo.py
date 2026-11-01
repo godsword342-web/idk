@@ -75,15 +75,20 @@ async def main():
     # execute_tool returns ExecutionResult; the raw data lives in the mapper,
     # so call the tool directly to inspect the output shape
     from tool import ToolResult
+    plan_events = []
     direct = await TodoWriteTool.call(TodoInput(todos=[
         TodoItem(content="read code", status="completed",
                  active_form="Reading code"),
-    ]), ctx)
+    ]), ctx, on_progress=plan_events.append)
     assert "old_todos" in direct.data
     assert "new_todos" in direct.data
     assert "verification_nudge_needed" in direct.data
     assert direct.data["old_todos"] == []
     assert len(direct.data["new_todos"]) == 1
+    assert plan_events == [{
+        "type": "plan_activity", "status": "updated", "item_count": 0,
+        "completed_count": 0, "in_progress_count": 0, "cleared": True,
+    }]
     print("✅ Output shape (old/new/nudge) OK")
 
     # ── 4. Model-facing result does NOT contain the list ──

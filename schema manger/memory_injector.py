@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Callable
 
 from memdir import (
     SelectionContext,
@@ -70,19 +70,39 @@ async def build_memory_injection(
     context: Any,
     query_source: str = "",
     include_summary: bool = True,
+    on_event: Callable[[dict[str, object]], None] | None = None,
 ) -> str:
     """Return one compact reminder; do not modify conversation history."""
     if query_source in ("compact", "session_memory"):
         return ""
+
+    def emit(source: str, count: int = 0, names: list[str] | None = None) -> None:
+        if on_event is None:
+            return
+        event: dict[str, object] = {
+            "type": "runtime_activity",
+            "area": "memory",
+            "status": "injected",
+            "source": source,
+            "count": count,
+        }
+        if names:
+            event["names"] = names[:20]
+        try:
+            on_event(event)
+        except Exception:
+            pass
 
     parts: list[str] = []
     store = getattr(context, "_store", None)
     session_id = getattr(context, "session_id", None)
     if store is not None and session_id:
         try:
-            plan = _format_plan(store.get_plan(session_id))
+            stored_plan = store.get_plan(session_id)
+            plan = _format_plan(stored_plan)
             if plan:
                 parts.append(plan)
+                emit("plan", len(stored_plan.get("items", [])))
         except Exception:
             pass
         if include_summary:
@@ -90,6 +110,7 @@ async def build_memory_injection(
                 summary = store.get_root_summary(session_id)
                 if summary and summary.get("content"):
                     parts.append("Conversation summary:\n" + summary["content"][:8_000])
+                    emit("conversation_summary")
             except Exception:
                 pass
 
@@ -111,6 +132,7 @@ async def build_memory_injection(
 
                 selected = await find_relevant_memories(memories, selection)
                 memory_parts: list[str] = []
+                selected_names: list[str] = []
                 for memory in selected:
                     body = load_memory_content(memory)
                     if not body:
@@ -121,10 +143,12 @@ async def build_memory_injection(
                     if freshness:
                         section = freshness + "\n" + section
                     memory_parts.append(section)
+                    selected_names.append(memory.name)
                     selection.already_surfaced.add(memory.filename)
                     selection.session_bytes_used += memory.size_bytes
                 if memory_parts:
                     parts.append("Relevant file memories:\n" + "\n\n".join(memory_parts))
+                    emit("project_files", len(memory_parts), selected_names)
             except (OSError, ValueError):
                 pass
 

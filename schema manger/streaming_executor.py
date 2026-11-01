@@ -17,6 +17,7 @@ abort the parent query — the turn continues.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Generator
@@ -551,22 +552,8 @@ def _override_abort_controller(
     if loop_guard is None:
         loop_guard = LoopGuardState()
         ctx._loop_guard = loop_guard
-    overridden = ToolUseContext(
-        abort_controller=controller,
-        read_file_state=ctx.read_file_state,
-        get_app_state=ctx.get_app_state,
-        set_app_state=ctx.set_app_state,
-        set_app_state_for_tasks=ctx.set_app_state_for_tasks,
-        agent_id=ctx.agent_id,
-        agent_type=ctx.agent_type,
-        should_avoid_permission_prompts=ctx.should_avoid_permission_prompts,
-        local_denial_tracking=ctx.local_denial_tracking,
-        messages=ctx.messages,
-        tool_use_id=ctx.tool_use_id,
-        set_in_progress_tool_use_ids=ctx.set_in_progress_tool_use_ids,
-        set_has_interruptible_tool_in_progress=ctx.set_has_interruptible_tool_in_progress,
-    )
-    overridden._loop_guard = loop_guard
+    overridden = copy.copy(ctx)
+    overridden.abort_controller = controller
     return overridden
 
 

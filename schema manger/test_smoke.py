@@ -43,7 +43,10 @@ def main():
 
     def cli_tools_registered():
         from registry import find
-        expected = ("Read", "Edit", "Write", "Bash", "TodoWrite", "MemorySearch", "MemoryExpand")
+        expected = (
+            "Read", "Edit", "Write", "Bash", "TodoWrite", "Task",
+            "MemorySearch", "MemoryExpand",
+        )
         missing = [name for name in expected if find(name) is None]
         assert not missing, f"CLI tools not registered: {missing}"
     check("CLI tool registration", cli_tools_registered)
