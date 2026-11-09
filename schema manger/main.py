@@ -72,15 +72,15 @@ Available tools:
     Read existing files first; prefer Edit for targeted changes.
 - Bash(command, timeout?, description?): runs a shell command.
 - TodoWrite(todos): updates the current task list.
-- Task(tasks): runs a DAG of isolated task workers. Declare `needs`, `read_files`, and
-    `write_files`; dependency outputs are passed directly. Read-only tasks fan out,
-    while all writing tasks run exclusively.
+{task_tool_description}
 - MemorySearch(query, limit?): searches this session's saved messages.
 - MemoryExpand(node_id, kind?): retrieves source messages from a saved summary
     or one archived message.
 
 Use memory search/expansion when prior stored context is relevant. Read files
 before editing them.
+
+{task_layer_guidance}
 
 Work incrementally. After each tool result, decide if you need more
 information or if you can answer. When you've completed the user's request,
@@ -114,7 +114,30 @@ def build_context() -> ToolUseContext:
 def build_full_system_prompt() -> str:
     sys_ctx = get_system_context()
     usr_ctx = get_user_context()
-    parts = [SYSTEM_PROMPT]
+    task_description = (
+        "- Task(tasks): runs a DAG of isolated task workers when the deterministic split "
+        "gate selects wide execution. Declare an estimate (steps, sequential dependency, "
+        "independent branches, read-heavy, disjoint writes, uncertainty), `needs`, exact `read_files`/"
+        "`write_files`, `non_goals`, acceptance checks, optional `output_schema`, and a "
+        "per-node `budget`. Read-only tasks fan out; writers run exclusively and workers "
+        "return bounded summaries plus artifact pointers."
+    )
+    task_guidance = (
+        "Use three layers deliberately: you are the planner/orchestrator, Task workers "
+        "are bounded implementers, and registered tools are the execution layer. Stay "
+        "single-agent for small, sequential, tightly coupled, or tool-heavy work. Supply "
+        "a realistic split estimate; the runtime keeps sequential or <=8-step work single, "
+        "uses wide execution only for at least 3 independent branches with read-heavy or "
+        "disjoint work, and explores uncertain work in the parent first. Declare dependencies and exact "
+        "file scopes, and set each task's complexity from 1 to 5. Use `tier_hint` only "
+        "when the default mapping is unsuitable. Set acceptance checks and budgets; use an "
+        "output schema for structured dependencies. Workers do not delegate or coordinate "
+        "with one another. Review their summaries and changes before reporting completion."
+    )
+    runtime_prompt = SYSTEM_PROMPT.replace(
+        "{task_tool_description}", task_description,
+    ).replace("{task_layer_guidance}", task_guidance)
+    parts = [runtime_prompt]
     if sys_ctx:
         parts.append(format_system_context_for_prompt(sys_ctx))
     if usr_ctx:

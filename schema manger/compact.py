@@ -149,7 +149,10 @@ def _max_output_tokens_for_model(model: str) -> int:
         return 8_192
 
 
-def _current_model() -> str:
+def _current_model(context: Any = None) -> str:
+    model_override = getattr(context, "model_override", None)
+    if model_override:
+        return model_override
     try:
         from api import get_active_model
         return get_active_model()
@@ -1027,7 +1030,7 @@ async def compact_conversation(
         if not messages:
             raise ValueError(ERROR_MESSAGE_NOT_ENOUGH_MESSAGES)
 
-        model = _current_model()
+        model = _current_model(context)
         pre_compact_token_count = token_count_with_estimation(messages)
 
         _progress(context, {"type": "hooks_start", "hook_type": "pre_compact"})
@@ -1198,7 +1201,7 @@ async def autocompact(
     ):
         return {"compaction_result": None, "consecutive_failures": None}
 
-    model = _current_model()
+    model = _current_model(tool_use_context)
     if not should_auto_compact(messages, model, query_source, snip_tokens_freed):
         return {"compaction_result": None, "consecutive_failures": None}
 

@@ -774,6 +774,9 @@ async def query_loop(
 # ── Helpers ─────────────────────────────────────────────────────────────
 
 def _current_model(ctx: ToolUseContext) -> str:
+    model_override = getattr(ctx, "model_override", None)
+    if model_override:
+        return model_override
     if hasattr(ctx, "_fallback_model") and ctx._fallback_model:
         return ctx._fallback_model
     from api import get_active_model
@@ -788,9 +791,16 @@ def _publish_query_messages(params: QueryParams, messages: list) -> None:
 def _tools_for_context(context: ToolUseContext | None) -> list:
     tools = all_tools()
     allowed = getattr(context, "allowed_tool_names", None)
-    if allowed is None:
-        return tools
-    return [tool for tool in tools if tool.name in allowed]
+    available = []
+    for tool in tools:
+        if allowed is not None and tool.name not in allowed:
+            continue
+        try:
+            if tool.is_enabled():
+                available.append(tool)
+        except Exception:
+            logger.exception("Tool %s enablement check failed closed", tool.name)
+    return available
 
 
 def _archive_query_messages(context: ToolUseContext, messages: list) -> None:

@@ -27,6 +27,10 @@ import json
 import logging
 import os
 import random
+import re
+import threading
+import weakref
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import AsyncGenerator, Callable
@@ -119,6 +123,41 @@ MAX_RETRIES_PER_MODEL = 2
 MAX_RETRY_BACKOFF_SECONDS = 8.0
 MAX_RETRY_AFTER_SECONDS = 120.0
 RETRY_BACKOFF_BASE_SECONDS = 1.0
+DEFAULT_PROVIDER_MAX_CONCURRENCY = 4
+
+_PROVIDER_SEMAPHORES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_PROVIDER_SEMAPHORES_LOCK = threading.Lock()
+
+
+def _provider_concurrency_limit(provider: str) -> int:
+    provider_key = re.sub(r"[^A-Z0-9]+", "_", provider.upper())
+    raw = os.environ.get(
+        f"AGENT_PROVIDER_MAX_CONCURRENCY_{provider_key}",
+        os.environ.get("AGENT_PROVIDER_MAX_CONCURRENCY", ""),
+    )
+    try:
+        return max(1, int(raw)) if raw else DEFAULT_PROVIDER_MAX_CONCURRENCY
+    except ValueError:
+        return DEFAULT_PROVIDER_MAX_CONCURRENCY
+
+
+def _provider_semaphore(model: str) -> asyncio.Semaphore:
+    provider = model.split("/", 1)[0].lower()
+    limit = _provider_concurrency_limit(provider)
+    loop = asyncio.get_running_loop()
+    with _PROVIDER_SEMAPHORES_LOCK:
+        per_loop = _PROVIDER_SEMAPHORES.setdefault(loop, {})
+        configured = per_loop.get(provider)
+        if configured is None or configured[0] != limit:
+            per_loop[provider] = (limit, asyncio.Semaphore(limit))
+        return per_loop[provider][1]
+
+
+@asynccontextmanager
+async def provider_request_slot(model: str):
+    """Share a bounded request slot across all calls to one provider."""
+    async with _provider_semaphore(model):
+        yield
 
 
 class ProviderRequestError(RuntimeError):
@@ -775,7 +814,8 @@ async def _call_with_fallback(
             if enable_thinking and _model_supports_thinking(model):
                 call_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 4096}
             try:
-                response = await litellm.acompletion(**call_kwargs)
+                async with provider_request_slot(model):
+                    response = await litellm.acompletion(**call_kwargs)
                 if model != original_model:
                     logger.info("Fell back from %s to %s", original_model, model)
                 return response, model

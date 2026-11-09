@@ -8,9 +8,10 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 from pydantic import BaseModel, Field, field_validator
+from agent_contracts import AcceptanceCheck, TaskBudget
 
 
 class TaskSpec(BaseModel):
@@ -19,6 +20,30 @@ class TaskSpec(BaseModel):
     needs: list[str] = Field(default_factory=list)
     read_files: list[str] = Field(default_factory=list)
     write_files: list[str] = Field(default_factory=list)
+    non_goals: list[str] = Field(
+        default_factory=list,
+        description="Explicitly excluded work for this node.",
+    )
+    output_schema: dict[str, Any] | None = Field(
+        default=None,
+        description="JSON Schema required for the worker's structured output.",
+    )
+    acceptance: list[AcceptanceCheck] = Field(
+        default_factory=list,
+        description="Deterministic checks; exists checks must target write_files.",
+    )
+    budget: TaskBudget = Field(
+        default_factory=TaskBudget,
+        description="Hard per-node token, call, time, and tool-error limits.",
+    )
+    complexity: int = Field(
+        default=3, ge=1, le=5,
+        description="Planner estimate from routine (1) to strong reasoning (5).",
+    )
+    tier_hint: Literal["T1", "T2", "T3"] | None = Field(
+        default=None,
+        description="Optional override for the configured complexity-to-tier mapping.",
+    )
 
     @field_validator("instruction")
     @classmethod
@@ -206,6 +231,22 @@ def validate_task_graph(
     for task in tasks:
         reads = frozenset(canonical_task_path(path, project_root) for path in task.read_files)
         writes = frozenset(canonical_task_path(path, project_root) for path in task.write_files)
+        for check in task.acceptance:
+            check_path = canonical_task_path(check.spec, project_root)
+            if check_path not in writes:
+                raise ValueError(
+                    f"Task {task.id} acceptance path must be in write_files: {check.spec}"
+                )
+        if task.output_schema is not None:
+            from jsonschema import Draft202012Validator
+            from jsonschema.exceptions import SchemaError
+
+            try:
+                Draft202012Validator.check_schema(task.output_schema)
+            except SchemaError as error:
+                raise ValueError(
+                    f"Task {task.id} has an invalid output schema"
+                ) from error
         normalized.append(ValidatedTask(task, reads, writes))
 
     for index, left in enumerate(normalized):

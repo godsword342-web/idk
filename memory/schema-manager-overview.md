@@ -45,18 +45,23 @@ The current editor buffer `schema manger/experiments/stream_writer.py` is not pr
 ## Current orchestration and verification
 - TodoWrite persists the plan to AppState and SQLite; the UI PlanPanel reads the stored plan. Completed plans are cleared. Strict caps are opt-in.
 - Task accepts up to eight DAG nodes; the scheduler allows up to four ready read-only workers and serializes writers. File scopes, dependency links, and write leases are validated. Child query tests still use a fake query, so live/model selection is unproven.
+- Task nodes now accept complexity (1-5), an optional T1/T2/T3 hint, non-goals, output JSON Schema, deterministic file-existence checks, and per-node token/call/time/tool-error budgets. `worker_tiers.yaml` maps tiers to models; complexity defaults map 1-2 to T1, 3-4 to T2, and 5 to T3. Child queries and compaction use the resolved worker model. Workers return validated result envelopes with bounded summaries and SHA-256 artifact references; dependent workers receive the envelope and the parent receives summaries/artifacts, not raw worker output. Shell-command acceptance checks, full artifact storage, and independent LLM verification remain unimplemented.
+- Task remains available. Its deterministic split gate defaults to single-agent when no estimate is supplied, the work is sequential, or estimated steps are at most eight. Wide execution requires at least three independent branches and a read-heavy or disjoint-write estimate; DAG root counts are checked against the estimate. Uncertain work returns to the parent for exploration. `phase0_gate.py` validates baseline reports; `phase0_eval.py` validates datasets, summarizes metrics, and applies the Pyramid kill criteria. These are evaluation utilities, not runtime kill switches. The evaluator is implemented, but no real benchmark dataset/results have been supplied or run.
+- Provider requests now share per-provider concurrency semaphores across model, compaction, and classifier calls. `AGENT_PROVIDER_MAX_CONCURRENCY` defaults to four; `AGENT_PROVIDER_MAX_CONCURRENCY_<PROVIDER>` overrides an individual provider. This does not yet enforce RPM or TPM quotas.
 - Memory injection runs per query from the active plan, root summary, and selected project-memory files. MemorySearch/MemoryExpand are model-callable and session-scoped. The automatic injection and explicit tool calls now produce safe UI activity notices.
-- The last full run of every `test_*.py` script in `schema manger/` passed after provider and activity changes. Editor diagnostics reported no errors and `git diff --check` was clean.
+- The last full run of every `test_*.py` script in `schema manger/` passed after the deterministic split gate was added. Task integration tests use a fake query; no live worker/model calls were made. Editor diagnostics reported no errors and `git diff --check` was clean.
 - Tests are executable scripts; `pytest 'schema manger/'` previously found no pytest tests. Use `cd 'schema manger' && for test in test_*.py; do python "$test" || exit $?; done` for the established full-suite check.
 - No commit was made. Worktree includes other user changes and generated `__pycache__`/`output_log.txt`; do not clean/revert them without authorization.
 
 ## Next Work
-1. Add a provider-wide async concurrency limiter shared across parent requests and Task child queries; retain the Task scheduler's separate DAG/read/write limits.
-2. Build a deterministic production-query test with scripted parent and child model responses. Verify the parent actually calls TodoWrite, Task, MemorySearch, and MemoryExpand; assert query routing, child event visibility, dependency results, and permissions without live API calls.
-3. Consider adding `Tool.prompt` to provider-visible descriptions so the model sees the intended use guidance. Test description limits and provider compatibility first.
-4. Keep a separate opt-in live NVIDIA smoke test and diagnose the intermittent 404 only from redacted status/body/request-ID evidence.
-5. Evaluate LiteLLM Router features against the pinned version before replacing local retry logic. Do not add LangGraph just for a DAG, or FastMCP unless external MCP tool connectivity is needed.
-6. Treat OS-level sandboxing and provider-neutral ToolSearch as separate design projects; neither exists in the current runtime.
+1. Supply 30 representative tasks across the four Phase 0 shapes, then run `python phase0_eval.py --dataset <tasks.json> --report <results.json> --output <summary.json>` after collecting single-T3 and single-T2 baselines. Record deterministic checks, quality, tokens, calls, latency, cost, and human review; no live evaluation has been run.
+2. Calibrate split estimates against those baselines, then compare the full Pyramid. Apply the documented quality/cost kill criteria before making wide fan-out the default.
+3. Add per-provider RPM/TPM token buckets on top of concurrency slots; retain the Task scheduler's separate DAG/read/write limits.
+4. Add independent V2 verification and join consistency checks; consider full content-addressed artifact storage and durable run events.
+5. Build a deterministic production-query test with scripted parent and child model responses. Verify parent tool selection, tier routing through the provider adapter, child event visibility, dependency results, and permissions without live API calls.
+6. Consider adding `Tool.prompt` to provider-visible descriptions so the model sees the intended use guidance. Test description limits and provider compatibility first.
+7. Keep a separate opt-in live NVIDIA smoke test and diagnose the intermittent 404 only from redacted status/body/request-ID evidence.
+8. Treat OS-level sandboxing and provider-neutral ToolSearch as separate design projects; neither exists in the current runtime.
 
 ## Historical Notes
 The sections in the prior version of this document below described an earlier memory/context implementation phase. Preserve those details as history, but use the current-state sections above for present behavior.

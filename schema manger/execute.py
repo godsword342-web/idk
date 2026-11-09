@@ -95,6 +95,16 @@ async def execute_tool(
             f"Unknown tool: {tool_name}. Available tools: {_list_tool_names()}",
         )
 
+    try:
+        enabled = bool(tool.is_enabled())
+    except Exception:
+        enabled = False
+    if not enabled:
+        return _error_result(
+            tool_use_id, tool_name,
+            f"Tool {tool_name} is disabled by runtime policy.",
+        )
+
     allowed_tools = getattr(context, "allowed_tool_names", None)
     if allowed_tools is not None and tool_name not in allowed_tools:
         return _error_result(

@@ -269,6 +269,39 @@ async def main():
     assert len(thinking_events) == 2
     print("✅ Streaming thinking OK")
 
+    # ── Provider-wide request concurrency cap ──
+    active_requests = 0
+    max_active_requests = 0
+    release_requests = asyncio.Event()
+    reached_limit = asyncio.Event()
+
+    async def bounded_completion(**_kwargs):
+        nonlocal active_requests, max_active_requests
+        active_requests += 1
+        max_active_requests = max(max_active_requests, active_requests)
+        if active_requests == 2:
+            reached_limit.set()
+        await release_requests.wait()
+        active_requests -= 1
+        return MagicMock()
+
+    mock_litellm.acompletion.reset_mock()
+    mock_litellm.acompletion.side_effect = bounded_completion
+    with patch.dict(os.environ, {"AGENT_PROVIDER_MAX_CONCURRENCY": "2"}):
+        requests = [
+            asyncio.create_task(api._call_with_fallback(
+                {"model": "groq/test-model", "messages": []},
+                enable_thinking=False,
+            ))
+            for _ in range(5)
+        ]
+        await asyncio.wait_for(reached_limit.wait(), timeout=1)
+        assert active_requests == 2
+        release_requests.set()
+        await asyncio.gather(*requests)
+    assert max_active_requests == 2
+    print("✅ Provider concurrency cap OK")
+
     # ── 429 honors Retry-After and retries the same model ──
     mock_litellm.acompletion.reset_mock()
     rate_limit = mock_litellm.RateLimitError(

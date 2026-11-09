@@ -248,16 +248,19 @@ async def classify_yolo_action(
 
     # ── STAGE 1: FAST ──
     try:
-        stage1_response = await litellm.acompletion(
-            model=CLASSIFIER_MODEL,
-            max_tokens=STAGE_1_MAX_TOKENS,
-            temperature=0,
-            messages=[
-                {"role": "system", "content": STAGE_1_SYSTEM},
-                {"role": "user", "content": classifier_user},
-            ],
-            timeout=10,
-        )
+        from api import provider_request_slot
+
+        async with provider_request_slot(CLASSIFIER_MODEL):
+            stage1_response = await litellm.acompletion(
+                model=CLASSIFIER_MODEL,
+                max_tokens=STAGE_1_MAX_TOKENS,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": STAGE_1_SYSTEM},
+                    {"role": "user", "content": classifier_user},
+                ],
+                timeout=10,
+            )
     except Exception as e:
         logger.warning("Classifier stage 1 failed: %s", e)
         return _empty_result(start, f"Classifier stage 1 failed: {e}")
@@ -284,16 +287,17 @@ async def classify_yolo_action(
 
     # ── STAGE 2: THINKING (only if Stage 1 denied) ──
     try:
-        stage2_response = await litellm.acompletion(
-            model=CLASSIFIER_MODEL,
-            max_tokens=STAGE_2_MAX_TOKENS,
-            temperature=0,
-            messages=[
-                {"role": "system", "content": STAGE_2_SYSTEM},
-                {"role": "user", "content": classifier_user},
-            ],
-            timeout=20,
-        )
+        async with provider_request_slot(CLASSIFIER_MODEL):
+            stage2_response = await litellm.acompletion(
+                model=CLASSIFIER_MODEL,
+                max_tokens=STAGE_2_MAX_TOKENS,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": STAGE_2_SYSTEM},
+                    {"role": "user", "content": classifier_user},
+                ],
+                timeout=20,
+            )
     except Exception as e:
         # Stage 1 denied, Stage 2 failed → trust Stage 1 (fail-closed)
         logger.warning("Classifier stage 2 failed: %s", e)

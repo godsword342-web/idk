@@ -143,6 +143,29 @@ async def main():
         except ValueError as error:
             assert "outside the project" in str(error)
 
+        try:
+            validate_task_graph([
+                TaskSpec(
+                    id="bad-check", instruction="check undeclared file",
+                    write_files=[alpha_path],
+                    acceptance=[{"kind": "exists", "spec": beta_path}],
+                ),
+            ], root)
+            raise AssertionError("acceptance checks outside write scope should fail")
+        except ValueError as error:
+            assert "acceptance path must be in write_files" in str(error)
+
+        try:
+            validate_task_graph([
+                TaskSpec(
+                    id="bad-schema", instruction="invalid schema",
+                    output_schema={"type": "not-a-json-schema-type"},
+                ),
+            ], root)
+            raise AssertionError("invalid output schemas should fail")
+        except ValueError as error:
+            assert "invalid output schema" in str(error)
+
     print("Task DAG scheduler and file lease tests passed")
 
 

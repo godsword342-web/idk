@@ -1,0 +1,8 @@
+version: 1
+tiers:
+  T1:
+    model: groq/openai/gpt-oss-20b
+  T2:
+    model: gemini/gemini-3.8-flash
+  T3:
+    model: ACTIVE_MODEL
