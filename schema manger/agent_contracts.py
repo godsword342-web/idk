@@ -1,0 +1,51 @@
+"""Typed contracts shared by the planner, task workers, and verifier."""
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+
+class TaskBudget(BaseModel):
+    max_tokens: int = Field(default=8_000, ge=1, description="Maximum cumulative output tokens.")
+    max_calls: int = Field(default=8, ge=1, le=32, description="Maximum model/tool turns.")
+    max_seconds: int = Field(default=120, ge=1, le=1_800, description="Wall-clock deadline.")
+    max_tool_errors: int = Field(default=3, ge=1, le=20, description="Maximum tool errors before stopping.")
+
+
+class AcceptanceCheck(BaseModel):
+    kind: Literal["exists"]
+    spec: str = Field(
+        min_length=1,
+        description="Project-relative path that must exist and be in write_files.",
+    )
+
+
+class ArtifactRef(BaseModel):
+    path: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size_bytes: int = Field(ge=0)
+
+
+class WorkerUsage(BaseModel):
+    output_tokens: int = Field(default=0, ge=0)
+    calls: int = Field(default=0, ge=0)
+    seconds: float = Field(default=0, ge=0)
+
+
+class TaskResultEnvelope(BaseModel):
+    schema_version: Literal["1.0"] = "1.0"
+    run_id: str
+    node_id: str
+    status: Literal["ok", "failed", "needs_escalation", "contract_change_request"]
+    summary: str = Field(max_length=1_200)
+    output: dict[str, Any] = Field(default_factory=dict)
+    artifacts: list[ArtifactRef] = Field(default_factory=list)
+    usage: WorkerUsage = Field(default_factory=WorkerUsage)
+    diagnostics: str | None = None
+
+
+__all__ = [
+    "AcceptanceCheck", "ArtifactRef", "TaskBudget", "TaskResultEnvelope",
+    "WorkerUsage",
+]
