@@ -44,6 +44,13 @@ class TaskSpec(BaseModel):
         default=None,
         description="Optional override for the configured complexity-to-tier mapping.",
     )
+    verification_mode: Literal["none", "independent"] = Field(
+        default="none",
+        description=(
+            "Request a fresh-context independent verifier after deterministic checks. "
+            "Requires a verifier model distinct from the worker model."
+        ),
+    )
 
     @field_validator("instruction")
     @classmethod

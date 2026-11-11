@@ -9,9 +9,11 @@ from agent_tasks import AgentTasksInput, AgentTasksTool
 from execute import execute_tool
 from api import get_active_model
 from messages import ToolResultMessage, create_assistant_message
+from model_router import resolve_task_model
 from query_transitions import Terminal
 from registry import clear, register
 from state import AppState, FileStateCache, ToolPermissionContext
+from store import Store
 from task_scheduler import FileLeaseRegistry, TaskFileScope
 from split_gate import SplitEstimate
 from tool import ToolUseContext
@@ -48,6 +50,8 @@ async def main():
         prompts: dict[str, str] = {}
         worker_tools: dict[str, frozenset[str]] = {}
         worker_models: dict[str, str] = {}
+        verifier_models: dict[str, str] = {}
+        verifier_tools: dict[str, frozenset[str]] = {}
         worker_budgets: dict[str, tuple[int, int]] = {}
         progress_events = []
         slow_worker_closed = asyncio.Event()
@@ -66,6 +70,23 @@ async def main():
             worker = params.tool_use_context
             prompt = params.messages[0].content
             task_id = prompt.split("\n", 1)[0].removeprefix("Task ID: ")
+            if params.query_source == "task_verifier":
+                verifier_models[task_id] = worker.model_override
+                verifier_tools[task_id] = worker.allowed_tool_names
+                message = create_assistant_message(
+                    content=json.dumps({
+                        "passed": True,
+                        "confidence": 0.95,
+                        "findings": [],
+                    }),
+                    stop_reason="end_turn",
+                    usage={"output_tokens": 9},
+                )
+                params.messages.append(message)
+                yield message
+                yield Terminal(reason="completed")
+                return
+
             prompts[task_id] = prompt
             worker_tools[task_id] = worker.allowed_tool_names
             worker_models[task_id] = worker.model_override
@@ -144,6 +165,7 @@ async def main():
         original_query = agent_tasks.query
         agent_tasks.query = fake_query
         parent_context = make_context(root)
+        parent_context._store = Store(os.path.join(root, "session.db"))
         parent_controller = type(
             "ParentController", (), {"aborted": False, "reason": None},
         )()
@@ -162,6 +184,7 @@ async def main():
                     },
                     {
                         "id": "schema", "instruction": "Return a typed answer",
+                        "verification_mode": "independent",
                         "output_schema": {
                             "type": "object",
                             "properties": {"answer": {"type": "string"}},
@@ -218,6 +241,16 @@ async def main():
 
         outcomes = result.data["tasks"]
         assert result.data["mode"] == "wide"
+        assert result.data["events_persisted"] is True
+        stored_events = parent_context._store.get_task_events(
+            parent_context.session_id, result.data["run_id"],
+        )
+        assert stored_events
+        assert all(event["type"] == "task_lifecycle" for event in stored_events)
+        assert all(
+            "instruction" not in event and "output" not in event
+            for event in stored_events
+        )
         assert [outcome["status"] for outcome in outcomes] == [
             "succeeded", "succeeded", "succeeded", "failed", "failed",
             "failed", "failed", "succeeded",
@@ -226,12 +259,19 @@ async def main():
         assert "second output" in prompts["combine"]
         assert worker_tools["first"] == frozenset({"Read"})
         assert "Task" not in worker_tools["combine"]
-        assert worker_models["first"] == "groq/openai/gpt-oss-20b"
+        assert worker_models["first"] == resolve_task_model(1, "T1")
         assert worker_models["second"] == "test/parent-fallback"
-        assert worker_models["combine"] == "groq/openai/gpt-oss-20b"
+        assert worker_models["combine"] == resolve_task_model(1, "T1")
+        assert verifier_models["schema"] != worker_models["schema"]
+        assert verifier_tools["schema"] == frozenset({"Read"})
         assert worker_budgets["schema"] == (2, 400)
         assert worker_budgets["token-limit"] == (8, 4)
         assert next(item for item in outcomes if item["id"] == "schema")["summary"] == "Typed result"
+        verified_schema = next(item for item in outcomes if item["id"] == "schema")
+        assert verified_schema["verification"]["passed"] is True
+        assert verified_schema["verification"]["model_id"] == verifier_models["schema"]
+        assert verified_schema["usage"]["output_tokens"] == 9
+        assert verified_schema["usage"]["calls"] == 1
         invalid_result = next(
             item for item in outcomes if item["id"] == "schema-invalid"
         )

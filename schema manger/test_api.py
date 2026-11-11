@@ -302,6 +302,48 @@ async def main():
     assert max_active_requests == 2
     print("✅ Provider concurrency cap OK")
 
+    # ── Provider RPM/TPM buckets use provider-specific overrides ──
+    with patch.dict(os.environ, {
+        "AGENT_PROVIDER_MAX_RPM": "60",
+        "AGENT_PROVIDER_MAX_RPM_GROQ": "120",
+        "AGENT_PROVIDER_MAX_TPM": "6000",
+        "AGENT_PROVIDER_MAX_TPM_GROQ": "9000",
+    }):
+        limiter = api._provider_rate_limiter("groq/test-model")
+        assert limiter.rpm == 120
+        assert limiter.tpm == 9000
+        reservation = await limiter.acquire(8500)
+        assert reservation.tokens == 8500
+        await reservation.settle(5000)
+
+    mock_litellm.acompletion.reset_mock()
+    with patch.dict(os.environ, {"AGENT_PROVIDER_MAX_TPM_GROQ": "1"}):
+        try:
+            async for _ in stream(
+                [create_user_message("request exceeds configured token capacity")],
+                model="groq/test-model",
+                max_tokens=8,
+                enable_thinking=False,
+            ):
+                pass
+            raise AssertionError("expected configured TPM capacity failure")
+        except ProviderRequestError as error:
+            assert error.category == "rate_limited"
+    assert mock_litellm.acompletion.call_count == 0
+    fake_clock = [0.0]
+
+    async def advance_rate_clock(seconds):
+        fake_clock[0] += seconds
+
+    with patch("api.time.monotonic", lambda: fake_clock[0]), patch(
+        "api.asyncio.sleep", advance_rate_clock,
+    ):
+        rpm_limiter = api._ProviderRateLimiter("test-provider", rpm=1, tpm=0)
+        await rpm_limiter.acquire(0)
+        await rpm_limiter.acquire(0)
+    assert fake_clock[0] == 60.0
+    print("✅ Provider RPM/TPM overrides and capacity enforcement OK")
+
     # ── 429 honors Retry-After and retries the same model ──
     mock_litellm.acompletion.reset_mock()
     rate_limit = mock_litellm.RateLimitError(

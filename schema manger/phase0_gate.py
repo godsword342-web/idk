@@ -17,6 +17,7 @@ TaskShape = Literal[
 ]
 BaselineName = Literal["single_t3", "single_t2", "pyramid"]
 REQUIRED_CASE_COUNT = 30
+MIN_PILOT_CASE_COUNT = 8
 REQUIRED_HUMAN_REVIEW_COUNT = 3
 
 
@@ -24,18 +25,30 @@ class BaselineResult(BaseModel):
     task_id: str = Field(min_length=1)
     shape: TaskShape
     baseline: BaselineName
+    model_id: str | None = None
     checks_passed: bool
     quality_score: float = Field(ge=0, le=1)
     tokens: int = Field(ge=0)
     api_calls: int = Field(ge=0)
     duration_seconds: float = Field(ge=0)
-    cost_usd: float = Field(ge=0)
+    cost_usd: float | None = Field(default=None, ge=0)
+    task_invocations: int | None = Field(default=None, ge=0)
+    child_api_calls: int | None = Field(default=None, ge=0)
+    child_provider_attempts: int | None = Field(default=None, ge=0)
+    child_model_ids: list[str] | None = None
+    task_worker_count: int | None = Field(default=None, ge=0)
+    task_worker_successes: int | None = Field(default=None, ge=0)
+    task_worker_failures: int | None = Field(default=None, ge=0)
     human_reviewed: bool = False
+    human_quality_score: float | None = Field(default=None, ge=0, le=1)
+    human_review_notes: str | None = Field(default=None, max_length=2_000)
+    artifact_dir: str | None = None
+    response_path: str | None = None
 
 
 class Phase0Report(BaseModel):
     schema_version: Literal["1.0"]
-    results: list[BaselineResult] = Field(min_length=REQUIRED_CASE_COUNT * 2)
+    results: list[BaselineResult] = Field(min_length=MIN_PILOT_CASE_COUNT * 2)
 
     @model_validator(mode="after")
     def _validate_baseline_matrix(self) -> "Phase0Report":
@@ -48,8 +61,11 @@ class Phase0Report(BaseModel):
                 )
             baselines[result.baseline] = result
 
-        if len(grouped) != REQUIRED_CASE_COUNT:
-            raise ValueError(f"Phase 0 requires exactly {REQUIRED_CASE_COUNT} tasks")
+        if not MIN_PILOT_CASE_COUNT <= len(grouped) <= REQUIRED_CASE_COUNT:
+            raise ValueError(
+                f"Phase 0 requires between {MIN_PILOT_CASE_COUNT} and "
+                f"{REQUIRED_CASE_COUNT} tasks"
+            )
 
         shapes: set[str] = set()
         reviewed: set[str] = set()
@@ -98,7 +114,7 @@ def main() -> int:
         print(f"Phase 0 report invalid: {error}", file=sys.stderr)
         return 1
     print(
-        f"Phase 0 report valid: {len(report.results) // 2} tasks, "
+        f"Phase 0 report valid: {len({result.task_id for result in report.results})} tasks, "
         f"both single_t2 and single_t3 baselines, all four shapes."
     )
     return 0

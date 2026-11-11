@@ -61,6 +61,18 @@ CREATE TABLE IF NOT EXISTS plan (
     updated_at  REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS task_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    run_id      TEXT NOT NULL,
+    task_id     TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    payload     TEXT NOT NULL,
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_events_run
+    ON task_events(session_id, run_id, id);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content,
     content='messages',
@@ -256,6 +268,37 @@ class Store:
         d = dict(row)
         d["items"] = json.loads(d["items"])
         return d
+
+    def append_task_event(
+        self,
+        session_id: str,
+        run_id: str,
+        event: dict,
+    ) -> int:
+        """Append a sanitized Task lifecycle event to durable session history."""
+        if not session_id or not run_id:
+            raise ValueError("Task events require session_id and run_id")
+        if event.get("type") != "task_lifecycle":
+            raise ValueError("Only Task lifecycle events may be persisted here")
+        task_id = event.get("task_id")
+        status = event.get("status")
+        if not isinstance(task_id, str) or not isinstance(status, str):
+            raise ValueError("Task lifecycle events require task_id and status")
+        payload = json.dumps(event, ensure_ascii=True, sort_keys=True)
+        cur = self.db.execute(
+            "INSERT INTO task_events (session_id, run_id, task_id, status, payload, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, run_id, task_id, status, payload, time.time()),
+        )
+        self.db.commit()
+        return int(cur.lastrowid)
+
+    def get_task_events(self, session_id: str, run_id: str) -> list[dict]:
+        rows = self.db.execute(
+            "SELECT payload FROM task_events WHERE session_id = ? AND run_id = ? ORDER BY id",
+            (session_id, run_id),
+        ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
 
     # ── View assembly (the "projection") ───────────────────────────────
 

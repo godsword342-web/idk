@@ -248,17 +248,27 @@ async def classify_yolo_action(
 
     # ── STAGE 1: FAST ──
     try:
-        from api import provider_request_slot
+        from api import (
+            _estimate_message_tokens,
+            _usage_token_total,
+            provider_request_slot,
+        )
 
-        async with provider_request_slot(CLASSIFIER_MODEL):
+        stage1_messages = [
+            {"role": "system", "content": STAGE_1_SYSTEM},
+            {"role": "user", "content": classifier_user},
+        ]
+        async with provider_request_slot(
+            CLASSIFIER_MODEL,
+            estimated_tokens=(
+                _estimate_message_tokens(stage1_messages) + STAGE_1_MAX_TOKENS
+            ),
+        ) as stage1_reservation:
             stage1_response = await litellm.acompletion(
                 model=CLASSIFIER_MODEL,
                 max_tokens=STAGE_1_MAX_TOKENS,
                 temperature=0,
-                messages=[
-                    {"role": "system", "content": STAGE_1_SYSTEM},
-                    {"role": "user", "content": classifier_user},
-                ],
+                messages=stage1_messages,
                 timeout=10,
             )
     except Exception as e:
@@ -267,6 +277,9 @@ async def classify_yolo_action(
 
     stage1_text = stage1_response.choices[0].message.content or ""
     stage1_usage = _extract_usage(stage1_response)
+    actual_tokens = _usage_token_total(stage1_usage)
+    if actual_tokens is not None:
+        await stage1_reservation.settle(actual_tokens)
 
     should_block, reason = _parse_decision(stage1_text)
 
@@ -287,15 +300,21 @@ async def classify_yolo_action(
 
     # ── STAGE 2: THINKING (only if Stage 1 denied) ──
     try:
-        async with provider_request_slot(CLASSIFIER_MODEL):
+        stage2_messages = [
+            {"role": "system", "content": STAGE_2_SYSTEM},
+            {"role": "user", "content": classifier_user},
+        ]
+        async with provider_request_slot(
+            CLASSIFIER_MODEL,
+            estimated_tokens=(
+                _estimate_message_tokens(stage2_messages) + STAGE_2_MAX_TOKENS
+            ),
+        ) as stage2_reservation:
             stage2_response = await litellm.acompletion(
                 model=CLASSIFIER_MODEL,
                 max_tokens=STAGE_2_MAX_TOKENS,
                 temperature=0,
-                messages=[
-                    {"role": "system", "content": STAGE_2_SYSTEM},
-                    {"role": "user", "content": classifier_user},
-                ],
+                messages=stage2_messages,
                 timeout=20,
             )
     except Exception as e:
@@ -316,6 +335,9 @@ async def classify_yolo_action(
 
     stage2_text = stage2_response.choices[0].message.content or ""
     stage2_usage = _extract_usage(stage2_response)
+    actual_tokens = _usage_token_total(stage2_usage)
+    if actual_tokens is not None:
+        await stage2_reservation.settle(actual_tokens)
     stage2_should_block, stage2_reason = _parse_decision(stage2_text)
 
     # Combine usage

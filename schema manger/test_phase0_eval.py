@@ -8,6 +8,7 @@ from phase0_eval import (
     assess_pyramid,
     report_json,
     summarize_results,
+        assess_efficiency,
 )
 from phase0_gate import Phase0Report
 
@@ -71,11 +72,15 @@ def main():
         ],
     })
     assert len(dataset.tasks) == 30
+    pilot_dataset = EvaluationDataset.model_validate({
+        "schema_version": "1.0", "tasks": dataset.tasks[:8],
+    })
+    assert len(pilot_dataset.tasks) == 8
     try:
         EvaluationDataset.model_validate({
-            "schema_version": "1.0", "tasks": dataset.tasks[:29],
+            "schema_version": "1.0", "tasks": dataset.tasks[:7],
         })
-        raise AssertionError("a short dataset should fail validation")
+        raise AssertionError("a dataset below the pilot minimum should fail")
     except ValueError:
         pass
 
@@ -85,6 +90,26 @@ def main():
     summaries = summarize_results(baseline_report.results)
     assert summaries["single_t3:breadth_research"]["success_rate"] == 1.0
     assert summaries["single_t3:breadth_research"]["cost_per_success_usd"] == 0.1
+    assert summaries["single_t3:breadth_research"]["task_telemetry_runs"] == 0
+    assert summaries["single_t3:breadth_research"]["child_api_calls"] is None
+    assert assess_efficiency(baseline_report)["eligible"] is False
+
+    failed_attempt_results = make_results()
+    failed_attempt = next(
+        result for result in failed_attempt_results
+        if result["task_id"] == "case-00" and result["baseline"] == "single_t3"
+    )
+    failed_attempt["checks_passed"] = False
+    failed_attempt["cost_usd"] = 0.5
+    failed_attempt_report = Phase0Report.model_validate({
+        "schema_version": "1.0", "results": failed_attempt_results,
+    })
+    assert round(
+        summarize_results(failed_attempt_report.results)[
+            "single_t3:breadth_research"
+        ]["cost_per_success_usd"],
+        4,
+    ) == 0.1714
 
     passing_report = Phase0Report.model_validate({
         "schema_version": "1.0", "results": make_results(pyramid_cost=0.06),
@@ -97,8 +122,34 @@ def main():
         "schema_version": "1.0", "results": make_results(pyramid_cost=0.09),
     })
     assert assess_pyramid(failing_report)["passes_kill_criteria"] is False
+    efficiency = assess_efficiency(passing_report)
+    assert efficiency["faster_without_quality_loss"] is True
+    assert efficiency["fewer_tokens_without_quality_loss"] is True
+    assert efficiency["best_single_baseline"] == "single_t3"
     assert json.loads(report_json(passing_report))["pyramid_assessment"][
         "passes_kill_criteria"
+    ] is True
+    assert json.loads(report_json(passing_report))[
+        "pyramid_efficiency_assessment"
+    ]["faster_without_quality_loss"] is True
+
+    unknown_cost_results = make_results(pyramid_cost=0.06)
+    for result in unknown_cost_results:
+        result["cost_usd"] = None
+        result["model_id"] = "nvidia_nim/example-model"
+    unknown_cost_report = Phase0Report.model_validate({
+        "schema_version": "1.0", "results": unknown_cost_results,
+    })
+    unknown_cost_summary = json.loads(report_json(unknown_cost_report))
+    assert unknown_cost_summary["metrics"][
+        "single_t2:breadth_research"
+    ]["cost_per_success_usd"] is None
+    assert unknown_cost_summary["pyramid_assessment"][
+        "passes_kill_criteria"
+    ] is False
+    assert unknown_cost_summary["pyramid_assessment"]["cost_reduction"] is None
+    assert unknown_cost_summary["pyramid_efficiency_assessment"][
+        "faster_without_quality_loss"
     ] is True
 
     with tempfile.TemporaryDirectory() as temporary:

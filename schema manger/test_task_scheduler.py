@@ -59,9 +59,12 @@ async def main():
             "alpha": "alpha findings",
             "beta": "beta findings",
         }
-        assert [(event["task_id"], event["status"]) for event in events] == [
-            ("alpha", "started"), ("beta", "started"),
+        lifecycle = [(event["task_id"], event["status"]) for event in events]
+        assert lifecycle[:2] == [("alpha", "started"), ("beta", "started")]
+        assert set(lifecycle[2:4]) == {
             ("alpha", "succeeded"), ("beta", "succeeded"),
+        }
+        assert lifecycle[4:] == [
             ("summary", "started"), ("summary", "succeeded"),
         ]
         assert all("instruction" not in event and "write_files" not in event for event in events)

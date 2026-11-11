@@ -11,6 +11,9 @@ class TaskBudget(BaseModel):
     max_calls: int = Field(default=8, ge=1, le=32, description="Maximum model/tool turns.")
     max_seconds: int = Field(default=120, ge=1, le=1_800, description="Wall-clock deadline.")
     max_tool_errors: int = Field(default=3, ge=1, le=20, description="Maximum tool errors before stopping.")
+    max_verifier_tokens: int = Field(default=1_000, ge=1, description="Verifier output-token cap.")
+    max_verifier_calls: int = Field(default=2, ge=1, le=4, description="Verifier model/tool-turn cap.")
+    max_verifier_seconds: int = Field(default=60, ge=1, le=300, description="Verifier wall-clock deadline.")
 
 
 class AcceptanceCheck(BaseModel):
@@ -33,6 +36,14 @@ class WorkerUsage(BaseModel):
     seconds: float = Field(default=0, ge=0)
 
 
+class VerificationResult(BaseModel):
+    passed: bool
+    confidence: float = Field(ge=0, le=1)
+    findings: list[str] = Field(default_factory=list, max_length=10)
+    model_id: str = Field(min_length=1)
+    usage: WorkerUsage = Field(default_factory=WorkerUsage)
+
+
 class TaskResultEnvelope(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
     run_id: str
@@ -42,10 +53,11 @@ class TaskResultEnvelope(BaseModel):
     output: dict[str, Any] = Field(default_factory=dict)
     artifacts: list[ArtifactRef] = Field(default_factory=list)
     usage: WorkerUsage = Field(default_factory=WorkerUsage)
+    verification: VerificationResult | None = None
     diagnostics: str | None = None
 
 
 __all__ = [
     "AcceptanceCheck", "ArtifactRef", "TaskBudget", "TaskResultEnvelope",
-    "WorkerUsage",
+    "VerificationResult", "WorkerUsage",
 ]

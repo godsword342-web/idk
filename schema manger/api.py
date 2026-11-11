@@ -29,8 +29,10 @@ import os
 import random
 import re
 import threading
+import time
 import weakref
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import AsyncGenerator, Callable
@@ -127,6 +129,8 @@ DEFAULT_PROVIDER_MAX_CONCURRENCY = 4
 
 _PROVIDER_SEMAPHORES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _PROVIDER_SEMAPHORES_LOCK = threading.Lock()
+_PROVIDER_RATE_LIMITERS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_PROVIDER_RATE_LIMITERS_LOCK = threading.Lock()
 
 
 def _provider_concurrency_limit(provider: str) -> int:
@@ -153,11 +157,133 @@ def _provider_semaphore(model: str) -> asyncio.Semaphore:
         return per_loop[provider][1]
 
 
+def _configured_provider_rate_limit(name: str, provider: str) -> int:
+    provider_key = re.sub(r"[^A-Z0-9]+", "_", provider.upper())
+    raw = os.environ.get(
+        f"AGENT_PROVIDER_MAX_{name}_{provider_key}",
+        os.environ.get(f"AGENT_PROVIDER_MAX_{name}", "0"),
+    )
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("Ignoring invalid AGENT_PROVIDER_MAX_%s value for %s", name, provider)
+        return 0
+
+
+def _provider_rate_limits(provider: str) -> tuple[int, int]:
+    return (
+        _configured_provider_rate_limit("RPM", provider),
+        _configured_provider_rate_limit("TPM", provider),
+    )
+
+
+@dataclass(frozen=True)
+class _ProviderReservation:
+    limiter: "_ProviderRateLimiter"
+    tokens: int
+
+    async def settle(self, actual_tokens: int) -> None:
+        await self.limiter.settle(self.tokens, actual_tokens)
+
+
+class _ProviderRateLimiter:
+    """Per-loop token bucket for configured provider request/token rates."""
+
+    def __init__(self, provider: str, rpm: int, tpm: int) -> None:
+        self.provider = provider
+        self.rpm = rpm
+        self.tpm = tpm
+        self._requests = float(rpm)
+        self._tokens = float(tpm)
+        self._updated_at = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        elapsed = max(0.0, now - self._updated_at)
+        self._updated_at = now
+        if self.rpm:
+            self._requests = min(float(self.rpm), self._requests + elapsed * self.rpm / 60)
+        if self.tpm:
+            self._tokens = min(float(self.tpm), self._tokens + elapsed * self.tpm / 60)
+
+    async def acquire(self, tokens: int) -> _ProviderReservation:
+        if self.tpm and tokens > self.tpm:
+            raise ProviderRequestError(
+                f"Estimated request exceeds configured TPM capacity for {self.provider}.",
+                category="rate_limited",
+                status_code=429,
+            )
+        while True:
+            async with self._lock:
+                self._refill()
+                request_wait = (
+                    max(0.0, 1.0 - self._requests) * 60 / self.rpm
+                    if self.rpm else 0.0
+                )
+                token_wait = (
+                    max(0.0, tokens - self._tokens) * 60 / self.tpm
+                    if self.tpm else 0.0
+                )
+                wait_seconds = max(request_wait, token_wait)
+                if wait_seconds <= 0:
+                    if self.rpm:
+                        self._requests -= 1
+                    if self.tpm:
+                        self._tokens -= tokens
+                    return _ProviderReservation(self, tokens if self.tpm else 0)
+            await asyncio.sleep(wait_seconds)
+
+    async def settle(self, reserved_tokens: int, actual_tokens: int) -> None:
+        if not self.tpm:
+            return
+        async with self._lock:
+            self._refill()
+            self._tokens = min(
+                float(self.tpm),
+                self._tokens + reserved_tokens - max(0, actual_tokens),
+            )
+
+
+def _provider_rate_limiter(model: str) -> _ProviderRateLimiter:
+    provider = model.split("/", 1)[0].lower()
+    rpm, tpm = _provider_rate_limits(provider)
+    loop = asyncio.get_running_loop()
+    with _PROVIDER_RATE_LIMITERS_LOCK:
+        per_loop = _PROVIDER_RATE_LIMITERS.setdefault(loop, {})
+        configured = per_loop.get(provider)
+        if configured is None or configured[:2] != (rpm, tpm):
+            limiter = _ProviderRateLimiter(provider, rpm, tpm)
+            per_loop[provider] = (rpm, tpm, limiter)
+        return per_loop[provider][2]
+
+
+def _estimate_message_tokens(messages: list) -> int:
+    try:
+        content = json.dumps(messages, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        content = str(messages)
+    return max(1, (len(content) + 3) // 4)
+
+
+def _usage_token_total(usage: Any) -> int | None:
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        input_tokens = usage.get("input_tokens", usage.get("prompt_tokens", 0))
+        output_tokens = usage.get("output_tokens", usage.get("completion_tokens", 0))
+    else:
+        input_tokens = getattr(usage, "prompt_tokens", 0)
+        output_tokens = getattr(usage, "completion_tokens", 0)
+    return max(0, int(input_tokens or 0)) + max(0, int(output_tokens or 0))
+
+
 @asynccontextmanager
-async def provider_request_slot(model: str):
-    """Share a bounded request slot across all calls to one provider."""
+async def provider_request_slot(model: str, estimated_tokens: int = 0):
+    """Apply configured RPM/TPM budgets and a shared in-flight request cap."""
+    reservation = await _provider_rate_limiter(model).acquire(max(0, estimated_tokens))
     async with _provider_semaphore(model):
-        yield
+        yield reservation
 
 
 class ProviderRequestError(RuntimeError):
@@ -593,7 +719,7 @@ async def stream(
         "model": target_model, "query_source": query_source or "unknown",
     }
     try:
-        response, target_model = await _call_with_fallback(
+        response, target_model, reservation = await _call_with_fallback(
             kwargs, enable_thinking, fallback_model=fallback_model,
             query_source=query_source, on_event=activity_events.append,
         )
@@ -699,6 +825,10 @@ async def stream(
         stop_reason = "end_turn"
     elif stop_reason is None:
         stop_reason = "end_turn"
+
+    actual_tokens = _usage_token_total(final_usage)
+    if actual_tokens is not None:
+        await reservation.settle(actual_tokens)
 
     yield {
         "type": "message_stop",
@@ -814,11 +944,19 @@ async def _call_with_fallback(
             if enable_thinking and _model_supports_thinking(model):
                 call_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 4096}
             try:
-                async with provider_request_slot(model):
+                estimated_tokens = (
+                    _estimate_message_tokens(call_kwargs.get("messages", []))
+                    + max(0, int(call_kwargs.get("max_tokens", 0) or 0))
+                )
+                async with provider_request_slot(
+                    model, estimated_tokens=estimated_tokens,
+                ) as reservation:
                     response = await litellm.acompletion(**call_kwargs)
                 if model != original_model:
                     logger.info("Fell back from %s to %s", original_model, model)
-                return response, model
+                return response, model, reservation
+            except ProviderRequestError:
+                raise
             except Exception as error:
                 category = _failure_category(error)
                 details = _log_provider_failure(
@@ -911,9 +1049,12 @@ async def complete(
     if response_format:
         kwargs["response_format"] = response_format
 
-    response, _response_model = await _call_with_fallback(
+    response, _response_model, reservation = await _call_with_fallback(
         kwargs, enable_thinking=False, fallback_model=fallback_model,
         query_source=query_source,
     )
+    actual_tokens = _usage_token_total(getattr(response, "usage", None))
+    if actual_tokens is not None:
+        await reservation.settle(actual_tokens)
 
     return response.choices[0].message.content or ""

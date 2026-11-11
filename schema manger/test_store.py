@@ -89,6 +89,28 @@ def main():
     assert store.count_messages(sid) == 3
     print("✅ Messages persist across reopen OK")
 
+    # ── 8a. Task lifecycle events persist separately from conversation text ──
+    task_event = {
+        "type": "task_lifecycle",
+        "task_id": "worker-a",
+        "status": "succeeded",
+        "needs": [],
+        "duration_ms": 12,
+    }
+    store.append_task_event(sid, "run-1", task_event)
+    store.close()
+    store = Store(db)
+    assert store.get_task_events(sid, "run-1") == [task_event]
+    assert store.get_task_events(sid, "unknown-run") == []
+    try:
+        store.append_task_event(sid, "run-1", {
+            "type": "task_lifecycle", "status": "started",
+        })
+        raise AssertionError("incomplete Task events should be rejected")
+    except ValueError:
+        pass
+    print("✅ Task lifecycle events persist by run without transcript content")
+
     # ── 9. get_view assembles plan + summary + tail ──
     view = store.get_view(sid, fresh_tail=10)
     assert view[0]["type"] == "system_plan"
