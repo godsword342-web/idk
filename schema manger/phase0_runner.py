@@ -381,6 +381,7 @@ async def _run_trial(
 		task_id=task.task_id,
 		shape=task.shape,
 		baseline=baseline,
+		task_eligible_for_wide=task.task_eligible_for_wide,
 		model_id=actual_model,
 		checks_passed=all(checks),
 		quality_score=sum(checks) / len(checks),

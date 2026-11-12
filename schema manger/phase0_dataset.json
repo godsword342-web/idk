@@ -116,9 +116,10 @@
     {
       "task_id": "pipeline-01-region-totals",
       "shape": "data_pipeline",
+      "task_eligible_for_wide": true,
       "fixture": "phase0_fixtures",
-      "prompt": "Read sales.csv and write out/region_totals.json with total units and revenue for each region. Use the actual rows, not estimates.",
-      "acceptance": [{"kind":"schema","spec":"{\"path\":\"out/region_totals.json\",\"schema\":{\"type\":\"object\",\"properties\":{\"North\":{\"type\":\"object\",\"properties\":{\"units\":{\"type\":\"integer\"},\"revenue\":{\"type\":\"number\"}},\"required\":[\"units\",\"revenue\"]}},\"required\":[\"North\"]}}"},{"kind":"assert","spec":"{\"path\":\"out/region_totals.json\",\"json_path\":\"North.units\",\"equals\":5}"},{"kind":"assert","spec":"{\"path\":\"out/region_totals.json\",\"json_path\":\"North.revenue\",\"equals\":65.0}"}]
+      "prompt": "Read sales.csv and write out/region_totals.json with units and revenue totals for North, South, and East. Estimate the work first. Each region is an independent read-only aggregation; when the split gate permits wide execution, assign one branch per region and join the three results before writing the file. Use actual rows, not estimates.",
+      "acceptance": [{"kind":"schema","spec":"{\"path\":\"out/region_totals.json\",\"schema\":{\"type\":\"object\",\"properties\":{\"North\":{\"type\":\"object\",\"properties\":{\"units\":{\"type\":\"integer\"},\"revenue\":{\"type\":\"number\"}},\"required\":[\"units\",\"revenue\"]},\"South\":{\"type\":\"object\",\"properties\":{\"units\":{\"type\":\"integer\"},\"revenue\":{\"type\":\"number\"}},\"required\":[\"units\",\"revenue\"]},\"East\":{\"type\":\"object\",\"properties\":{\"units\":{\"type\":\"integer\"},\"revenue\":{\"type\":\"number\"}},\"required\":[\"units\",\"revenue\"]}},\"required\":[\"North\",\"South\",\"East\"]}}"},{"kind":"assert","spec":"{\"path\":\"out/region_totals.json\",\"json_path\":\"North.units\",\"equals\":5}"},{"kind":"assert","spec":"{\"path\":\"out/region_totals.json\",\"json_path\":\"North.revenue\",\"equals\":65.0}"},{"kind":"assert","spec":"{\"path\":\"out/region_totals.json\",\"json_path\":\"South.units\",\"equals\":5}"},{"kind":"assert","spec":"{\"path\":\"out/region_totals.json\",\"json_path\":\"South.revenue\",\"equals\":55.0}"},{"kind":"assert","spec":"{\"path\":\"out/region_totals.json\",\"json_path\":\"East.units\",\"equals\":3}"},{"kind":"assert","spec":"{\"path\":\"out/region_totals.json\",\"json_path\":\"East.revenue\",\"equals\":39.0}"}]
     },
     {
       "task_id": "pipeline-02-sku-totals",

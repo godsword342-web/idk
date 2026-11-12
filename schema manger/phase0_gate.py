@@ -25,6 +25,7 @@ class BaselineResult(BaseModel):
     task_id: str = Field(min_length=1)
     shape: TaskShape
     baseline: BaselineName
+    task_eligible_for_wide: bool = False
     model_id: str | None = None
     checks_passed: bool
     quality_score: float = Field(ge=0, le=1)
@@ -69,17 +70,58 @@ class Phase0Report(BaseModel):
 
         shapes: set[str] = set()
         reviewed: set[str] = set()
+        required_baselines = {"single_t2", "single_t3", "pyramid"}
+        telemetry_fields = (
+            "task_invocations", "child_api_calls", "child_provider_attempts",
+            "child_model_ids", "task_worker_count", "task_worker_successes",
+            "task_worker_failures",
+        )
         for task_id, baselines in grouped.items():
-            if not {"single_t2", "single_t3"}.issubset(baselines):
-                raise ValueError(f"Task {task_id} needs both single_t2 and single_t3 results")
-            if "pyramid" in baselines and len(baselines) != 3:
-                raise ValueError(f"Task {task_id} has an incomplete Pyramid result")
+            if set(baselines) != required_baselines:
+                raise ValueError(
+                    f"Task {task_id} needs single_t2, single_t3, and pyramid results"
+                )
             task_shapes = {result.shape for result in baselines.values()}
             if len(task_shapes) != 1:
                 raise ValueError(f"Task {task_id} has inconsistent task shapes")
+            eligibility = {
+                result.task_eligible_for_wide for result in baselines.values()
+            }
+            if len(eligibility) != 1:
+                raise ValueError(f"Task {task_id} has inconsistent wide eligibility")
             shapes.update(task_shapes)
-            if any(result.human_reviewed for result in baselines.values()):
+            reviewed_baselines = {
+                result.baseline for result in baselines.values()
+                if result.human_reviewed
+            }
+            if reviewed_baselines and reviewed_baselines != required_baselines:
+                raise ValueError(
+                    f"Task {task_id} must have all three configurations human-reviewed"
+                )
+            if reviewed_baselines == required_baselines:
                 reviewed.add(task_id)
+
+            pyramid = baselines["pyramid"]
+            missing_telemetry = [
+                name for name in telemetry_fields
+                if getattr(pyramid, name) is None
+            ]
+            if missing_telemetry:
+                raise ValueError(
+                    f"Pyramid result for {task_id} is missing Task telemetry: "
+                    + ", ".join(missing_telemetry)
+                )
+            if pyramid.task_eligible_for_wide and not all((
+                pyramid.task_invocations > 0,
+                pyramid.child_api_calls > 0,
+                pyramid.child_provider_attempts > 0,
+                bool(pyramid.child_model_ids),
+                pyramid.task_worker_count > 0,
+            )):
+                raise ValueError(
+                    f"Wide-eligible Pyramid task {task_id} did not record "
+                    "successful worker launch telemetry"
+                )
 
         if shapes != {
             "breadth_research", "multi_file_code",

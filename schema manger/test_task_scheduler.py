@@ -60,6 +60,16 @@ async def main():
             "beta": "beta findings",
         }
         lifecycle = [(event["task_id"], event["status"]) for event in events]
+        lifecycle_events = [event for event in events if event["type"] == "task_lifecycle"]
+        assert all(event["schema_version"] == "1.0" for event in lifecycle_events)
+        assert all(event["run_id"] for event in lifecycle_events)
+        assert all(event["event_id"] and event["occurred_at"] > 0 for event in lifecycle_events)
+        for task_id in ("alpha", "beta", "summary"):
+            attempts = {
+                event["attempt_id"] for event in lifecycle_events
+                if event["task_id"] == task_id and event["attempt_id"] is not None
+            }
+            assert len(attempts) == 1
         assert lifecycle[:2] == [("alpha", "started"), ("beta", "started")]
         assert set(lifecycle[2:4]) == {
             ("alpha", "succeeded"), ("beta", "succeeded"),
@@ -72,6 +82,103 @@ async def main():
             "duration_ms" in event
             for event in events if event["status"] in ("succeeded", "failed")
         )
+
+        joined_dependencies = {}
+        typed_calls = []
+
+        async def typed_runner(spec, dependencies, scope):
+            typed_calls.append(spec.id)
+            if spec.id == "producer":
+                return {"answer": "42"}
+            joined_dependencies.update(dependencies)
+            return "joined"
+
+        dependency_schema = {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        }
+        typed_results = await run_task_graph([
+            TaskSpec(id="producer", instruction="Return a typed answer"),
+            TaskSpec(
+                id="typed-join",
+                instruction="Consume the typed answer",
+                needs=["producer"],
+                dependency_output_schemas={"producer": dependency_schema},
+            ),
+        ], typed_runner, project_root=root)
+        assert all(result.status == TaskStatus.SUCCEEDED for result in typed_results)
+        assert joined_dependencies == {"producer": {"answer": "42"}}
+
+        invalid_calls = []
+
+        async def invalid_join_runner(spec, dependencies, scope):
+            invalid_calls.append(spec.id)
+            return {"answer": "not an integer"}
+
+        invalid_join = await run_task_graph([
+            TaskSpec(id="producer", instruction="Return a mismatched answer"),
+            TaskSpec(
+                id="typed-join",
+                instruction="Reject the mismatched answer",
+                needs=["producer"],
+                dependency_output_schemas={
+                    "producer": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "integer"}},
+                        "required": ["answer"],
+                    },
+                },
+            ),
+        ], invalid_join_runner, project_root=root)
+        assert invalid_join[0].status == TaskStatus.SUCCEEDED
+        assert invalid_join[1].status == TaskStatus.FAILED
+        assert "Dependency producer output failed its schema" in invalid_join[1].error
+        assert invalid_calls == ["producer"]
+
+        disjoint_write_a = os.path.join(root, "src", "writer-a.py")
+        disjoint_write_b = os.path.join(root, "src", "writer-b.py")
+        active_writers = 0
+        max_active_writers = 0
+        writers_started = asyncio.Event()
+
+        async def disjoint_writer(spec, dependencies, scope):
+            nonlocal active_writers, max_active_writers
+            assert scope.check_access("Write", spec.write_files[0]) is None
+            active_writers += 1
+            max_active_writers = max(max_active_writers, active_writers)
+            if active_writers == 2:
+                writers_started.set()
+            await asyncio.wait_for(writers_started.wait(), timeout=1)
+            active_writers -= 1
+            return spec.id
+
+        disjoint_results = await run_task_graph([
+            TaskSpec(
+                id="write-a", instruction="Write A", write_files=[disjoint_write_a],
+            ),
+            TaskSpec(
+                id="write-b", instruction="Write B", write_files=[disjoint_write_b],
+            ),
+        ], disjoint_writer, project_root=root, max_parallel=2)
+        assert all(result.status == TaskStatus.SUCCEEDED for result in disjoint_results)
+        assert max_active_writers == 2
+
+        try:
+            validate_task_graph([
+                TaskSpec(
+                    id="source-writer", instruction="Update shared source",
+                    write_files=[alpha_path],
+                ),
+                TaskSpec(
+                    id="source-reader", instruction="Read shared source",
+                    read_files=[alpha_path],
+                ),
+            ], root)
+            raise AssertionError("unordered read/write overlap should be rejected")
+        except ValueError as error:
+            assert "overlapping read/write scopes" in str(error)
 
         async def failing_runner(spec, dependencies, scope):
             if spec.id == "broken":
@@ -90,6 +197,61 @@ async def main():
             event["task_id"] == "blocked" and event["status"] == "blocked"
             for event in events
         )
+
+        joined_dependencies = {}
+        typed_calls = []
+
+        async def typed_runner(spec, dependencies, scope):
+            typed_calls.append(spec.id)
+            if spec.id == "producer":
+                return {"answer": "42"}
+            joined_dependencies.update(dependencies)
+            return "joined"
+
+        dependency_schema = {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        }
+        typed_results = await run_task_graph([
+            TaskSpec(id="producer", instruction="Return a typed answer"),
+            TaskSpec(
+                id="typed-join",
+                instruction="Consume the typed answer",
+                needs=["producer"],
+                dependency_output_schemas={"producer": dependency_schema},
+            ),
+        ], typed_runner, project_root=root)
+        assert all(result.status == TaskStatus.SUCCEEDED for result in typed_results)
+        assert joined_dependencies == {"producer": {"answer": "42"}}
+        assert typed_calls == ["producer", "typed-join"]
+
+        invalid_calls = []
+
+        async def invalid_join_runner(spec, dependencies, scope):
+            invalid_calls.append(spec.id)
+            return {"answer": "not an integer"}
+
+        invalid_join = await run_task_graph([
+            TaskSpec(id="producer", instruction="Return a mismatched answer"),
+            TaskSpec(
+                id="typed-join",
+                instruction="Reject the mismatched answer",
+                needs=["producer"],
+                dependency_output_schemas={
+                    "producer": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "integer"}},
+                        "required": ["answer"],
+                    },
+                },
+            ),
+        ], invalid_join_runner, project_root=root)
+        assert invalid_join[0].status == TaskStatus.SUCCEEDED
+        assert invalid_join[1].status == TaskStatus.FAILED
+        assert "Dependency producer output failed its schema" in invalid_join[1].error
+        assert invalid_calls == ["producer"]
 
         writers = [
             TaskSpec(id="writer-a", instruction="write A", write_files=[alpha_path]),

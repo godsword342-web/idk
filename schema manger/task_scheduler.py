@@ -5,6 +5,7 @@ import asyncio
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -12,11 +13,17 @@ from typing import Any, Awaitable, Callable, Literal
 
 from pydantic import BaseModel, Field, field_validator
 from agent_contracts import AcceptanceCheck, TaskBudget
+from task_checks import validate_acceptance_check
 
 
 class TaskSpec(BaseModel):
+    schema_version: Literal["1.0"] = "1.0"
     id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
     instruction: str = Field(min_length=1, max_length=20_000)
+    recovery_of: str | None = Field(
+        default=None,
+        description="Failed or blocked node ID this bounded recovery task replaces.",
+    )
     needs: list[str] = Field(default_factory=list)
     read_files: list[str] = Field(default_factory=list)
     write_files: list[str] = Field(default_factory=list)
@@ -27,6 +34,13 @@ class TaskSpec(BaseModel):
     output_schema: dict[str, Any] | None = Field(
         default=None,
         description="JSON Schema required for the worker's structured output.",
+    )
+    dependency_output_schemas: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        description=(
+            "Optional JSON Schemas keyed by prerequisite ID, checked before "
+            "this task receives dependency outputs."
+        ),
     )
     acceptance: list[AcceptanceCheck] = Field(
         default_factory=list,
@@ -87,7 +101,7 @@ class ValidatedTask:
 class TaskOutcome:
     task_id: str
     status: TaskStatus = TaskStatus.PENDING
-    output: str = ""
+    output: Any = None
     error: str = ""
 
 
@@ -239,10 +253,13 @@ def validate_task_graph(
         reads = frozenset(canonical_task_path(path, project_root) for path in task.read_files)
         writes = frozenset(canonical_task_path(path, project_root) for path in task.write_files)
         for check in task.acceptance:
-            check_path = canonical_task_path(check.spec, project_root)
+            declared_path = validate_acceptance_check(check)
+            if declared_path is None:
+                continue
+            check_path = canonical_task_path(declared_path, project_root)
             if check_path not in writes:
                 raise ValueError(
-                    f"Task {task.id} acceptance path must be in write_files: {check.spec}"
+                    f"Task {task.id} acceptance path must be in write_files: {declared_path}"
                 )
         if task.output_schema is not None:
             from jsonschema import Draft202012Validator
@@ -254,28 +271,63 @@ def validate_task_graph(
                 raise ValueError(
                     f"Task {task.id} has an invalid output schema"
                 ) from error
+        unknown_dependency_schemas = (
+            set(task.dependency_output_schemas) - set(task.needs)
+        )
+        if unknown_dependency_schemas:
+            raise ValueError(
+                f"Task {task.id} has dependency schemas for undeclared needs: "
+                + ", ".join(sorted(unknown_dependency_schemas))
+            )
+        if task.dependency_output_schemas:
+            from jsonschema import Draft202012Validator
+            from jsonschema.exceptions import SchemaError
+
+            for dependency_id, schema in task.dependency_output_schemas.items():
+                try:
+                    Draft202012Validator.check_schema(schema)
+                except SchemaError as error:
+                    raise ValueError(
+                        f"Task {task.id} has an invalid output schema for "
+                        f"dependency {dependency_id}"
+                    ) from error
         normalized.append(ValidatedTask(task, reads, writes))
 
     for index, left in enumerate(normalized):
         for right in normalized[index + 1:]:
-            overlaps = any(
+            ordered = (
+                depends_transitively(left.spec.id, right.spec.id)
+                or depends_transitively(right.spec.id, left.spec.id)
+            )
+            write_overlaps = any(
                 _paths_overlap(path_a, path_b)
                 for path_a in left.write_paths
                 for path_b in right.write_paths
             )
-            if overlaps and not (
-                depends_transitively(left.spec.id, right.spec.id)
-                or depends_transitively(right.spec.id, left.spec.id)
-            ):
+            if write_overlaps and not ordered:
                 raise ValueError(
                     f"Tasks {left.spec.id} and {right.spec.id} have overlapping "
                     "write scopes without an explicit dependency path"
+                )
+            read_write_overlaps = any(
+                _paths_overlap(write_path, read_path)
+                for write_paths, read_paths in (
+                    (left.write_paths, right.read_paths),
+                    (right.write_paths, left.read_paths),
+                )
+                for write_path in write_paths
+                for read_path in read_paths
+            )
+            if read_write_overlaps and not ordered:
+                raise ValueError(
+                    f"Tasks {left.spec.id} and {right.spec.id} have overlapping "
+                    "read/write scopes without an explicit dependency path"
                 )
     return normalized
 
 
 TaskRunner = Callable[
-    [TaskSpec, dict[str, str], TaskFileScope], Awaitable[str],
+    [TaskSpec, dict[str, Any], TaskFileScope], Awaitable[Any],
 ]
 
 
@@ -284,33 +336,42 @@ async def run_task_graph(
     runner: TaskRunner,
     *,
     project_root: str,
+    run_id: str | None = None,
     max_parallel: int = 4,
     on_event: Callable[[dict[str, object]], None] | None = None,
 ) -> list[TaskOutcome]:
-    """Run ready read tasks concurrently and write tasks exclusively.
+    """Run conflict-free ready tasks concurrently within the configured limit.
 
     A dependent receives a mapping of its declared prerequisite IDs to their
-    successful output. Failed prerequisites block dependents; independent
-    branches continue.
+    successful output. Write conflicts are serialized by dependencies and
+    process-local leases; independent readers and disjoint writers may overlap.
+    Failed prerequisites block dependents; independent branches continue.
     """
     if max_parallel < 1:
         raise ValueError("max_parallel must be at least one")
     graph = validate_task_graph(tasks, project_root)
+    run_id = run_id or uuid.uuid4().hex
     leases = FileLeaseRegistry(project_root)
     outcomes = {task.spec.id: TaskOutcome(task.spec.id) for task in graph}
     nodes = {task.spec.id: task for task in graph}
     active: dict[asyncio.Task, str] = {}
     started_at: dict[str, float] = {}
+    attempt_ids: dict[str, str] = {}
 
     def emit(task_id: str, status: str, **details: object) -> None:
         if on_event is None:
             return
         node = nodes[task_id]
         event: dict[str, object] = {
+            "schema_version": "1.0",
             "type": "task_lifecycle",
+            "event_id": uuid.uuid4().hex,
+            "run_id": run_id,
+            "attempt_id": attempt_ids.get(task_id),
             "task_id": task_id,
             "status": status,
             "needs": list(node.spec.needs),
+            "occurred_at": time.time(),
         }
         event.update(details)
         try:
@@ -318,7 +379,7 @@ async def run_task_graph(
         except Exception:
             pass
 
-    async def execute(node: ValidatedTask) -> str:
+    async def execute(node: ValidatedTask) -> Any:
         scope = TaskFileScope(
             task_id=node.spec.id,
             project_root=leases.project_root,
@@ -329,10 +390,27 @@ async def run_task_graph(
         if node.write_paths:
             leases.acquire(node.spec.id, node.write_paths)
         try:
-            dependency_outputs = {
+            dependency_outputs: dict[str, Any] = {
                 dependency: outcomes[dependency].output
                 for dependency in node.spec.needs
             }
+            for dependency_id, schema in node.spec.dependency_output_schemas.items():
+                result = dependency_outputs[dependency_id]
+                if hasattr(result, "output"):
+                    instance = result.output
+                elif isinstance(result, dict) and "output" in result:
+                    instance = result["output"]
+                else:
+                    instance = result
+                from jsonschema import Draft202012Validator
+
+                errors = list(Draft202012Validator(schema).iter_errors(instance))
+                if errors:
+                    path = ".".join(str(part) for part in errors[0].absolute_path)
+                    location = f" at {path}" if path else ""
+                    raise ValueError(
+                        f"Dependency {dependency_id} output failed its schema{location}"
+                    )
             return await runner(node.spec, dependency_outputs, scope)
         finally:
             if node.write_paths:
@@ -360,25 +438,14 @@ async def run_task_graph(
             if outcomes[node.spec.id].status == TaskStatus.PENDING
             and all(outcomes[dep].status == TaskStatus.SUCCEEDED for dep in node.spec.needs)
         ]
-        active_has_writer = any(nodes[task_id].write_paths for task_id in active.values())
-        active_readers = sum(not nodes[task_id].write_paths for task_id in active.values())
-
-        launch: list[ValidatedTask] = []
-        if not active and ready:
-            first_writer = next((node for node in ready if node.write_paths), None)
-            if first_writer is not None:
-                launch = [first_writer]
-            else:
-                launch = ready[:max_parallel]
-        elif not active_has_writer and active_readers < max_parallel:
-            launch = [
-                node for node in ready if not node.write_paths
-            ][:max_parallel - active_readers]
+        available_slots = max_parallel - len(active)
+        launch = ready[:available_slots] if available_slots > 0 else []
 
         for node in launch:
             outcome = outcomes[node.spec.id]
             outcome.status = TaskStatus.RUNNING
             started_at[node.spec.id] = time.perf_counter()
+            attempt_ids[node.spec.id] = uuid.uuid4().hex
             emit(node.spec.id, "started")
             task = asyncio.create_task(execute(node))
             active[task] = node.spec.id
@@ -395,6 +462,7 @@ async def run_task_graph(
                         task_id,
                         "succeeded",
                         duration_ms=round((time.perf_counter() - started_at[task_id]) * 1000),
+                        model_id=getattr(outcome.output, "model_id", None),
                     )
                 except asyncio.CancelledError:
                     outcome.status = TaskStatus.FAILED

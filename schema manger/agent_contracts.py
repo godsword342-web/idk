@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class TaskBudget(BaseModel):
@@ -16,18 +16,45 @@ class TaskBudget(BaseModel):
     max_verifier_seconds: int = Field(default=60, ge=1, le=300, description="Verifier wall-clock deadline.")
 
 
+class TaskRunBudget(BaseModel):
+    schema_version: Literal["1.0"] = "1.0"
+    max_output_tokens: int = Field(default=72_000, ge=1)
+    max_model_calls: int = Field(default=80, ge=1)
+    max_worker_seconds: float = Field(default=1_800, ge=1)
+
+
+class TaskLifecycleEvent(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    schema_version: Literal["1.0"]
+    type: Literal["task_lifecycle"]
+    event_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    attempt_id: str | None = None
+    task_id: str = Field(min_length=1)
+    status: Literal["started", "succeeded", "failed", "blocked"]
+    needs: list[str] = Field(default_factory=list)
+    occurred_at: float = Field(ge=0)
+    model_id: str | None = None
+
+
 class AcceptanceCheck(BaseModel):
-    kind: Literal["exists"]
+    kind: Literal["exists", "assert", "schema"]
     spec: str = Field(
         min_length=1,
-        description="Project-relative path that must exist and be in write_files.",
+        description=(
+            "exists: relative path. assert/schema: JSON spec with a confined "
+            "file path, or target='output' for a worker's structured output."
+        ),
     )
 
 
 class ArtifactRef(BaseModel):
+    schema_version: Literal["1.0"] = "1.0"
     path: str
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     size_bytes: int = Field(ge=0)
+    storage_key: str | None = None
 
 
 class WorkerUsage(BaseModel):
@@ -37,6 +64,7 @@ class WorkerUsage(BaseModel):
 
 
 class VerificationResult(BaseModel):
+    schema_version: Literal["1.0"] = "1.0"
     passed: bool
     confidence: float = Field(ge=0, le=1)
     findings: list[str] = Field(default_factory=list, max_length=10)
@@ -49,6 +77,7 @@ class TaskResultEnvelope(BaseModel):
     run_id: str
     node_id: str
     status: Literal["ok", "failed", "needs_escalation", "contract_change_request"]
+    model_id: str | None = None
     summary: str = Field(max_length=1_200)
     output: dict[str, Any] = Field(default_factory=dict)
     artifacts: list[ArtifactRef] = Field(default_factory=list)
@@ -58,6 +87,7 @@ class TaskResultEnvelope(BaseModel):
 
 
 __all__ = [
-    "AcceptanceCheck", "ArtifactRef", "TaskBudget", "TaskResultEnvelope",
+    "AcceptanceCheck", "ArtifactRef", "TaskBudget", "TaskLifecycleEvent",
+    "TaskRunBudget", "TaskResultEnvelope",
     "VerificationResult", "WorkerUsage",
 ]

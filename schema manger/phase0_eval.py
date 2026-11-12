@@ -37,6 +37,7 @@ class EvaluationTask(BaseModel):
     prompt: str = Field(min_length=1)
     acceptance: list[EvaluationCheck] = Field(min_length=1)
     fixture: str | None = None
+    task_eligible_for_wide: bool = False
 
 
 class EvaluationDataset(BaseModel):
@@ -76,12 +77,20 @@ def validate_report_matches_dataset(
     dataset: EvaluationDataset,
     report: Phase0Report,
 ) -> None:
-    expected = {task.task_id: task.shape for task in dataset.tasks}
+    expected = {
+        task.task_id: (task.shape, task.task_eligible_for_wide)
+        for task in dataset.tasks
+    }
     report_ids = {result.task_id for result in report.results}
     if report_ids != set(expected):
         raise ValueError("Report task IDs do not match the evaluation dataset")
-    if any(expected[result.task_id] != result.shape for result in report.results):
-        raise ValueError("Report task shapes do not match the evaluation dataset")
+    if any(
+        expected[result.task_id] != (
+            result.shape, result.task_eligible_for_wide,
+        )
+        for result in report.results
+    ):
+        raise ValueError("Report task metadata does not match the evaluation dataset")
 
 
 def _percentile(values: list[float], percentile: float) -> float:

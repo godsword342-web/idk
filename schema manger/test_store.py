@@ -2,6 +2,7 @@
 import os
 import stat
 import tempfile
+from pathlib import Path
 
 from store import Store
 
@@ -91,16 +92,80 @@ def main():
 
     # ── 8a. Task lifecycle events persist separately from conversation text ──
     task_event = {
+        "schema_version": "1.0",
         "type": "task_lifecycle",
+        "event_id": "event-1",
+        "run_id": "run-1",
+        "attempt_id": "attempt-1",
         "task_id": "worker-a",
         "status": "succeeded",
         "needs": [],
+        "occurred_at": 123.0,
+        "model_id": None,
         "duration_ms": 12,
     }
     store.append_task_event(sid, "run-1", task_event)
+    store.save_task_run(sid, "run-1", tmp, {
+        "schema_version": "1.0",
+        "run_id": "run-1",
+        "status": "completed",
+    })
     store.close()
     store = Store(db)
     assert store.get_task_events(sid, "run-1") == [task_event]
+    assert store.get_task_run("run-1", tmp) == {
+        "schema_version": "1.0",
+        "run_id": "run-1",
+        "status": "completed",
+    }
+    assert store.get_task_run("run-1", os.path.join(tmp, "other-project")) is None
+    assert store.get_task_run("run-1", tmp, "other-session") is None
+    assert store.get_task_run("unknown-run", tmp) is None
+    store.save_task_run(sid, "run-progress", tmp, {
+        "schema_version": "1.0",
+        "run_id": "run-progress",
+        "run_status": "running",
+        "task_specs": {"worker-b": {"schema_version": "1.0"}},
+        "progress": {},
+    })
+    for event_id, status in (("event-start", "started"), ("event-finish", "succeeded")):
+        store.append_task_event(sid, "run-progress", {
+            "schema_version": "1.0",
+            "type": "task_lifecycle",
+            "event_id": event_id,
+            "run_id": "run-progress",
+            "attempt_id": "attempt-b",
+            "task_id": "worker-b",
+            "status": status,
+            "needs": [],
+            "occurred_at": 124.0,
+        })
+    progress_run = store.get_task_run("run-progress", tmp, sid)
+    assert progress_run["run_status"] == "finalizing"
+    assert progress_run["progress"]["worker-b"]["status"] == "succeeded"
+    store.save_task_run(sid, "run-interrupted", tmp, {
+        "schema_version": "1.0",
+        "run_id": "run-interrupted",
+        "run_status": "running",
+        "task_specs": {"worker-c": {"schema_version": "1.0"}},
+        "progress": {},
+    })
+    store.append_task_event(sid, "run-interrupted", {
+        "schema_version": "1.0",
+        "type": "task_lifecycle",
+        "event_id": "event-interrupted-start",
+        "run_id": "run-interrupted",
+        "attempt_id": "attempt-c",
+        "task_id": "worker-c",
+        "status": "started",
+        "needs": [],
+        "occurred_at": 125.0,
+    })
+    store.close()
+    store = Store(db)
+    interrupted_run = store.get_task_run("run-interrupted", tmp, sid)
+    assert interrupted_run["run_status"] == "running"
+    assert interrupted_run["progress"]["worker-c"]["status"] == "started"
     assert store.get_task_events(sid, "unknown-run") == []
     try:
         store.append_task_event(sid, "run-1", {
@@ -110,6 +175,21 @@ def main():
     except ValueError:
         pass
     print("✅ Task lifecycle events persist by run without transcript content")
+
+    # ── 8b. Content-addressed artifacts persist and deduplicate ──
+    source_path = os.path.join(tmp, "artifact.bin")
+    Path(source_path).write_bytes(b"artifact payload")
+    artifact_one = store.put_artifact(source_path)
+    artifact_two = store.put_artifact(source_path)
+    assert artifact_one == artifact_two
+    stored_path = store.get_artifact_path(artifact_one["storage_key"])
+    assert stored_path is not None
+    assert Path(stored_path).read_bytes() == b"artifact payload"
+    store.close()
+    store = Store(db)
+    assert store.get_artifact_path(artifact_one["storage_key"]) == stored_path
+    assert store.get_artifact_path("../outside") is None
+    print("✅ Content-addressed artifacts persist and deduplicate")
 
     # ── 9. get_view assembles plan + summary + tail ──
     view = store.get_view(sid, fresh_tail=10)

@@ -24,9 +24,14 @@ Usage:
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import re
 import sqlite3
+import tempfile
 import time
+
+from agent_contracts import TaskLifecycleEvent
 
 
 SCHEMA = """
@@ -73,6 +78,16 @@ CREATE TABLE IF NOT EXISTS task_events (
 CREATE INDEX IF NOT EXISTS idx_task_events_run
     ON task_events(session_id, run_id, id);
 
+CREATE TABLE IF NOT EXISTS task_runs (
+    run_id       TEXT PRIMARY KEY,
+    session_id   TEXT NOT NULL,
+    project_root TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    updated_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_runs_project
+    ON task_runs(project_root, updated_at);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content,
     content='messages',
@@ -84,6 +99,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
 class Store:
     def __init__(self, path: str):
         expanded = os.path.expanduser(path)
+        self.path = os.path.abspath(expanded)
+        self.artifact_dir = self.path + ".artifacts"
         parent = os.path.dirname(expanded)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -280,17 +297,48 @@ class Store:
             raise ValueError("Task events require session_id and run_id")
         if event.get("type") != "task_lifecycle":
             raise ValueError("Only Task lifecycle events may be persisted here")
-        task_id = event.get("task_id")
-        status = event.get("status")
-        if not isinstance(task_id, str) or not isinstance(status, str):
-            raise ValueError("Task lifecycle events require task_id and status")
-        payload = json.dumps(event, ensure_ascii=True, sort_keys=True)
-        cur = self.db.execute(
-            "INSERT INTO task_events (session_id, run_id, task_id, status, payload, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (session_id, run_id, task_id, status, payload, time.time()),
+        if event.get("run_id") not in (None, run_id):
+            raise ValueError("Task event run_id does not match its storage key")
+        normalized = TaskLifecycleEvent.model_validate({**event, "run_id": run_id})
+        task_id = normalized.task_id
+        status = normalized.status
+        payload = json.dumps(
+            normalized.model_dump(mode="json"), ensure_ascii=True, sort_keys=True,
         )
-        self.db.commit()
+        now = time.time()
+        with self.db:
+            cur = self.db.execute(
+                "INSERT INTO task_events (session_id, run_id, task_id, status, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, run_id, task_id, status, payload, now),
+            )
+            row = self.db.execute(
+                "SELECT payload FROM task_runs WHERE session_id = ? AND run_id = ?",
+                (session_id, run_id),
+            ).fetchone()
+            if row:
+                run_payload = json.loads(row["payload"])
+                progress = run_payload.setdefault("progress", {})
+                progress[task_id] = normalized.model_dump(mode="json")
+                task_ids = set(run_payload.get("task_specs", {}))
+                terminal_statuses = {"succeeded", "failed", "blocked"}
+                if task_ids and all(
+                    progress.get(node_id, {}).get("status") in terminal_statuses
+                    for node_id in task_ids
+                ):
+                    run_payload["run_status"] = "finalizing"
+                else:
+                    run_payload["run_status"] = "running"
+                self.db.execute(
+                    "UPDATE task_runs SET payload = ?, updated_at = ? "
+                    "WHERE session_id = ? AND run_id = ?",
+                    (
+                        json.dumps(run_payload, ensure_ascii=True, sort_keys=True),
+                        now,
+                        session_id,
+                        run_id,
+                    ),
+                )
         return int(cur.lastrowid)
 
     def get_task_events(self, session_id: str, run_id: str) -> list[dict]:
@@ -299,6 +347,117 @@ class Store:
             (session_id, run_id),
         ).fetchall()
         return [json.loads(row["payload"]) for row in rows]
+
+    def put_artifact(self, source_path: str) -> dict[str, int | str]:
+        """Stream a workspace file into the local SHA-256 content store."""
+        os.makedirs(self.artifact_dir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(self.artifact_dir, 0o700)
+        except OSError:
+            pass
+        fd, temporary = tempfile.mkstemp(prefix=".artifact-", dir=self.artifact_dir)
+        digest = hashlib.sha256()
+        size_bytes = 0
+        try:
+            with os.fdopen(fd, "wb") as destination, open(source_path, "rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    destination.write(chunk)
+                    digest.update(chunk)
+                    size_bytes += len(chunk)
+                destination.flush()
+                os.fsync(destination.fileno())
+            sha256 = digest.hexdigest()
+            shard = os.path.join(self.artifact_dir, sha256[:2])
+            os.makedirs(shard, mode=0o700, exist_ok=True)
+            try:
+                os.chmod(shard, 0o700)
+            except OSError:
+                pass
+            destination_path = os.path.join(shard, sha256[2:])
+            if os.path.exists(destination_path):
+                os.unlink(temporary)
+            else:
+                os.replace(temporary, destination_path)
+            return {"sha256": sha256, "size_bytes": size_bytes, "storage_key": sha256}
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    def get_artifact_path(self, storage_key: str) -> str | None:
+        if not isinstance(storage_key, str) or not re.fullmatch(r"[0-9a-f]{64}", storage_key):
+            return None
+        path = os.path.join(self.artifact_dir, storage_key[:2], storage_key[2:])
+        return path if os.path.isfile(path) else None
+
+    def save_task_run(
+        self,
+        session_id: str,
+        run_id: str,
+        project_root: str,
+        payload: dict,
+    ) -> None:
+        """Persist a completed Task run for bounded recovery after restart."""
+        self.save_task_runs([{
+            "session_id": session_id,
+            "run_id": run_id,
+            "project_root": project_root,
+            "payload": payload,
+        }])
+
+    def save_task_runs(self, runs: list[dict]) -> None:
+        """Atomically persist one Task run and any updated recovery ancestors."""
+        prepared = []
+        for run in runs:
+            session_id = run.get("session_id")
+            run_id = run.get("run_id")
+            project_root = run.get("project_root")
+            payload = run.get("payload")
+            if not session_id or not run_id or not project_root:
+                raise ValueError("Task runs require session, run, and project IDs")
+            if not isinstance(payload, dict) or payload.get("schema_version") != "1.0":
+                raise ValueError("Unsupported Task run schema version")
+            if payload.get("run_id") != run_id:
+                raise ValueError("Task run payload ID does not match its key")
+            prepared.append((
+                run_id,
+                session_id,
+                os.path.realpath(os.path.abspath(project_root)),
+                json.dumps(payload, ensure_ascii=True, sort_keys=True),
+                time.time(),
+            ))
+        with self.db:
+            self.db.executemany(
+                "INSERT INTO task_runs (run_id, session_id, project_root, payload, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET "
+                "session_id = excluded.session_id, project_root = excluded.project_root, "
+                "payload = excluded.payload, updated_at = excluded.updated_at",
+                prepared,
+            )
+
+    def get_task_run(
+        self,
+        run_id: str,
+        project_root: str,
+        session_id: str | None = None,
+    ) -> dict | None:
+        """Load a run only when its saved project and optional session match."""
+        row = self.db.execute(
+            "SELECT session_id, project_root, payload FROM task_runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if not row:
+            return None
+        canonical_root = os.path.realpath(os.path.abspath(project_root))
+        if row["project_root"] != canonical_root:
+            return None
+        if session_id is not None and row["session_id"] != session_id:
+            return None
+        payload = json.loads(row["payload"])
+        if payload.get("schema_version") != "1.0" or payload.get("run_id") != run_id:
+            return None
+        return payload
 
     # ── View assembly (the "projection") ───────────────────────────────
 

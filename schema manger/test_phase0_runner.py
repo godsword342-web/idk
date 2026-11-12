@@ -35,6 +35,7 @@ async def main() -> None:
                     "task_id": f"case-{index}",
                     "shape": shapes[index % len(shapes)],
                     "prompt": f"Analyze fixture case {index}",
+                    "task_eligible_for_wide": index == 0,
                     "fixture": "fixtures",
                     "acceptance": [{
                         "kind": "assert",
@@ -54,6 +55,12 @@ async def main() -> None:
 
         async def fake_stream(**kwargs):
             requested_models.append(kwargs["model"])
+            yield {
+                "type": "runtime_activity",
+                "area": "model",
+                "status": "started",
+                "model": kwargs["model"],
+            }
             if kwargs.get("query_source") == "subagent_task":
                 yield {"type": "text_delta", "text": "Worker completed"}
                 yield {

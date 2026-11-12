@@ -34,6 +34,7 @@ def make_results(pyramid_cost: float | None = None):
                 "task_id": task_id,
                 "shape": shape,
                 "baseline": baseline,
+                "task_eligible_for_wide": index == 0,
                 "checks_passed": True,
                 "quality_score": quality,
                 "tokens": 1000,
@@ -42,19 +43,26 @@ def make_results(pyramid_cost: float | None = None):
                 "cost_usd": cost,
                 "human_reviewed": index < 3,
             })
-        if pyramid_cost is not None:
-            results.append({
-                "task_id": task_id,
-                "shape": shape,
-                "baseline": "pyramid",
-                "checks_passed": True,
-                "quality_score": 0.82,
-                "tokens": 700,
-                "api_calls": 5,
-                "duration_seconds": 8 + index,
-                "cost_usd": pyramid_cost,
-                "human_reviewed": index < 3,
-            })
+        results.append({
+            "task_id": task_id,
+            "shape": shape,
+            "baseline": "pyramid",
+            "task_eligible_for_wide": index == 0,
+            "checks_passed": True,
+            "quality_score": 0.82,
+            "tokens": 700,
+            "api_calls": 5,
+            "duration_seconds": 8 + index,
+            "cost_usd": pyramid_cost,
+            "task_invocations": 1 if index == 0 else 0,
+            "child_api_calls": 3 if index == 0 else 0,
+            "child_provider_attempts": 3 if index == 0 else 0,
+            "child_model_ids": ["test/worker"] if index == 0 else [],
+            "task_worker_count": 3 if index == 0 else 0,
+            "task_worker_successes": 3 if index == 0 else 0,
+            "task_worker_failures": 0,
+            "human_reviewed": index < 3,
+        })
     return results
 
 
@@ -66,6 +74,7 @@ def main():
                 "task_id": f"case-{index:02d}",
                 "shape": SHAPES[index % len(SHAPES)],
                 "prompt": f"Representative benchmark task {index}",
+                "task_eligible_for_wide": index == 0,
                 "acceptance": [{"kind": "assert", "spec": "result is correct"}],
             }
             for index in range(30)
@@ -92,7 +101,7 @@ def main():
     assert summaries["single_t3:breadth_research"]["cost_per_success_usd"] == 0.1
     assert summaries["single_t3:breadth_research"]["task_telemetry_runs"] == 0
     assert summaries["single_t3:breadth_research"]["child_api_calls"] is None
-    assert assess_efficiency(baseline_report)["eligible"] is False
+    assert assess_efficiency(baseline_report)["eligible"] is True
 
     failed_attempt_results = make_results()
     failed_attempt = next(
